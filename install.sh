@@ -16,7 +16,7 @@ Type=Application
 Name=Claude Tray
 Comment=Claude Code sessions in the top bar
 Exec=/usr/bin/python3 $APP
-Icon=$HOME/.cache/claude-tray/claude-tray-idle.svg
+Icon=$HOME/.cache/claude-tray/claude-tray-idle-0.svg
 Terminal=false
 X-GNOME-Autostart-enabled=true"
 echo "$DESKTOP" > ~/.config/autostart/claude-tray.desktop

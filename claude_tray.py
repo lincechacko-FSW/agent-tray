@@ -279,6 +279,7 @@ class Monitor:
             'pid': s.get('pid'),
             'status': status,
             'started': (s.get('startedAt') or 0) / 1000 or (t and t.first_ts),
+            'since': (s.get('statusUpdatedAt') or 0) / 1000 or None,
             'last': t and t.last_ts,
             'active': t.active if t else 0,
             'model': t and t.model,
@@ -372,22 +373,217 @@ if __name__ == '__main__':
 import gi  # noqa: E402  (imported after fork so the child owns the display connection)
 gi.require_version('Gtk', '3.0')
 gi.require_version('Gdk', '3.0')
+gi.require_version('Pango', '1.0')
 gi.require_version('AyatanaAppIndicator3', '0.1')
-from gi.repository import AyatanaAppIndicator3 as AI, Gdk, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import AyatanaAppIndicator3 as AI, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 
-ICON_COLORS = {'none': '#9a9a9a', 'idle': '#D97757', 'busy': '#4CAF50'}
-ICON_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 22 22">'
-            '<g stroke="{c}" stroke-width="2.6" stroke-linecap="round">'
-            '<line x1="11" y1="2.5" x2="11" y2="19.5"/><line x1="2.5" y1="11" x2="19.5" y2="11"/>'
-            '<line x1="5" y1="5" x2="17" y2="17"/><line x1="17" y1="5" x2="5" y2="17"/></g></svg>')
+ORANGE, GREY, GREEN_BG, GREEN = ('#F0A077', '#C95F3C'), ('#B9B5AD', '#77736B'), ('#5BE38F', '#1C9A52'), '#34C26E'
+ANIM_MS = {'spawn': 80, 'done': 120, 'close': 110, 'breathe': 500}
+NOTIFY_MIN_S = 10     # only popup for tasks that ran at least this long
+LABEL_FLASH_S = 4     # how long an event message stays next to the icon
+
+GLYPHS = {
+    'spark': ''.join(f'<line x1="16" y1="5.5" x2="16" y2="26.5" transform="rotate({a} 16 16)"/>'
+                     for a in (0, 45, 90, 135)),
+    'check': '<path d="M8 16.8 L13.2 22 L24 10.4" fill="none" stroke-linejoin="round"/>',
+    'cross': '<path d="M10 10 L22 22 M22 10 L10 22"/>',
+}
+
+
+def _mix(a, b, t):
+    pa, pb = (tuple(int(c[i:i + 2], 16) for i in (1, 3, 5)) for c in (a, b))
+    return '#%02x%02x%02x' % tuple(round(x + (y - x) * t) for x, y in zip(pa, pb))
+
+
+def icon_svg(grad=ORANGE, glyph='spark', scale=1.0, rot=0.0, pop=1.0, flash=0.0, fade=1.0, dot=None, dot_a=1.0):
+    """Edge-to-edge badge with a bold white glyph; pop scales the badge, scale/rot the glyph."""
+    s = ['<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">'
+         '<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
+         f'<stop offset="0" stop-color="{grad[0]}"/><stop offset="1" stop-color="{grad[1]}"/>'
+         f'</linearGradient></defs><g opacity="{fade:.2f}" '
+         f'transform="translate(16 16) scale({pop:.3f}) translate(-16 -16)">'
+         '<rect x="0" y="0" width="32" height="32" rx="8" fill="url(#g)"/>']
+    if flash:
+        s.append(f'<rect x="0" y="0" width="32" height="32" rx="8" fill="#fff" opacity="{flash:.2f}"/>')
+    s.append(f'<g stroke="#fff" stroke-width="4.4" stroke-linecap="round" '
+             f'transform="translate(16 16) rotate({rot:.1f}) scale({scale:.3f}) translate(-16 -16)">'
+             f'{GLYPHS[glyph]}</g></g>')
+    if dot:
+        s.append(f'<circle cx="25" cy="25" r="6.5" fill="{dot}" stroke="#111" stroke-width="1.8" '
+                 f'opacity="{dot_a:.2f}"/>')
+    s.append('</svg>')
+    return ''.join(s)
+
+
+def icon_frames():
+    return {
+        'none': [icon_svg(GREY)],
+        'idle': [icon_svg()],
+        'busy': [icon_svg(dot=GREEN)],
+        # new session: badge pops in, spark spins and overshoots under a fading flash
+        'spawn': [icon_svg(pop=p, scale=s, rot=r, flash=f) for p, s, r, f in
+                  ((.55, .4, -90, .7), (.7, .6, -65, .6), (.85, .85, -40, .5), (.95, 1.1, -20, .4),
+                   (1, 1.2, -8, .3), (1, 1.1, 0, .2), (1, 1.0, 0, .1), (1, 1, 0, 0))],
+        # task finished: whole icon turns green with a big check, pulses twice, holds
+        'done': [icon_svg(GREEN_BG, 'check', pop=p, scale=s, flash=f) for p, s, f in
+                 ((.55, .5, 0), (.75, .8, 0), (.95, 1.15, 0), (1, 1.05, 0), (1, 1, 0), (1, 1, .45), (1, 1, 0),
+                  (1, 1, .45), (1, 1, 0), (1, 1, 0), (1, 1, 0), (1, 1, 0), (1, 1, 0))],
+        # session closed: grey badge with a big cross, then fades out
+        'close': [icon_svg(GREY, 'cross', pop=p, scale=s, fade=f) for p, s, f in
+                  ((.6, .6, 1), (.85, 1.1, 1), (1, 1, 1), (1, 1, 1), (1, 1, 1), (1, 1, .85), (1, 1, .7),
+                   (1, 1, .55), (1, 1, .4))],
+        'breathe': [icon_svg(scale=s, dot=GREEN, dot_a=a) for s, a in
+                    ((1.0, 1.0), (1.07, .75), (1.12, .5), (1.07, .75))],
+    }
+
+
+class Notifier:
+    """Silent desktop popups over org.freedesktop.Notifications; one replaceable popup per session."""
+
+    def __init__(self, on_action):
+        self.on_action = on_action
+        self.ids = {}                    # session key -> notification id
+        self.proxy = None
+        try:
+            self.proxy = Gio.DBusProxy.new_for_bus_sync(
+                Gio.BusType.SESSION, Gio.DBusProxyFlags.DO_NOT_LOAD_PROPERTIES, None,
+                'org.freedesktop.Notifications', '/org/freedesktop/Notifications',
+                'org.freedesktop.Notifications', None)
+            self.proxy.connect('g-signal', self._signal)
+        except GLib.Error as e:
+            print('notifications unavailable:', e.message, file=sys.stderr)
+
+    def notify(self, key, title, body, icon):
+        if not self.proxy:
+            return
+        hints = {'suppress-sound': GLib.Variant('b', True),
+                 'desktop-entry': GLib.Variant('s', 'claude-tray')}
+        args = GLib.Variant('(susssasa{sv}i)', ('Claude Tray', self.ids.get(key, 0), icon, title, body,
+                                                ['default', 'Open dashboard', 'dash', 'Open dashboard'],
+                                                hints, -1))
+        self.proxy.call('Notify', args, Gio.DBusCallFlags.NONE, -1, None, self._sent, key)
+
+    def _sent(self, proxy, res, key):
+        try:
+            self.ids[key] = proxy.call_finish(res)[0]
+        except GLib.Error as e:
+            print('notify failed:', e.message, file=sys.stderr)
+
+    def _signal(self, _proxy, _sender, signal, params):
+        if signal == 'ActionInvoked' and params[0] in self.ids.values():
+            self.on_action()
+
+
+class Animator:
+    """Plays queued icon frame sequences, then returns to the resting icon (or a slow busy breathe)."""
+
+    def __init__(self, ind):
+        self.ind = ind
+        self.queue = []
+        self.timer = None
+        self.frames, self.i, self.loop = [], 0, False
+        self.rest, self.breathe = 'none', False
+        self._shown = None
+
+    def _show(self, name):
+        if name != self._shown:
+            self._shown = name
+            self.ind.set_icon_full(f'claude-tray-{name}', 'Claude sessions')
+
+    def set_rest(self, rest, breathe):
+        changed = (rest, breathe) != (self.rest, self.breathe)
+        self.rest, self.breathe = rest, breathe
+        if self.timer is None or (changed and self.loop):
+            self._next()
+
+    def play(self, anim):
+        if len(self.queue) < 4 and anim not in self.queue:
+            self.queue.append(anim)
+        if self.timer is None or self.loop:     # interrupt breathing, never a one-shot
+            self._next()
+
+    def _next(self):
+        if self.timer:
+            GLib.source_remove(self.timer)
+            self.timer = None
+        if self.queue:
+            anim, self.loop = self.queue.pop(0), False
+        elif self.breathe:
+            anim, self.loop = 'breathe', True
+        else:
+            self._show(f'{self.rest}-0')
+            return
+        self.frames = [f'{anim}-{i}' for i in range(len(ICON_FRAMES[anim]))]
+        self.i = 0
+        self._step()
+        self.timer = GLib.timeout_add(ANIM_MS[anim], self._step)
+
+    def _step(self):
+        if self.i >= len(self.frames):
+            if self.loop and not self.queue:
+                self.i = 0
+            else:
+                self.timer = None
+                self._next()
+                return False
+        self._show(self.frames[self.i])
+        self.i += 1
+        return True
+
+
+ICON_FRAMES = icon_frames()
+
+
 STATUS = {'busy': ('#4CAF50', '●', '🟢'), 'idle': ('#E0A030', '●', '🟡'), 'ended': ('#888888', '○', '⚪')}
 CSS = b"""
-.card { background-color: alpha(@theme_fg_color, 0.06); border-radius: 10px; padding: 10px 12px; }
-.dim { opacity: 0.65; }
-progressbar trough, progressbar progress { min-height: 6px; border-radius: 3px; }
-progressbar progress { background-color: #4CAF50; border-color: #4CAF50; }
-progressbar.warn progress { background-color: #E0A030; border-color: #E0A030; }
-progressbar.crit progress { background-color: #E05050; border-color: #E05050; }
+window.dash, window.dash viewport, .content { background-color: #000000; color: #F2F2F2; }
+window.dash headerbar { background-image: none; background-color: #0A0A0A; color: #F2F2F2;
+    border-bottom: 1px solid #1C1C1C; box-shadow: none; }
+window.dash headerbar button.titlebutton { color: #D4D4D4; border-radius: 999px; min-width: 24px; min-height: 24px;
+    padding: 2px; background-image: none; background-color: #1C1C1C; border: none; box-shadow: none; }
+window.dash headerbar button.titlebutton:hover { background-color: #2A2A2A; color: #FFFFFF; }
+window.dash headerbar button.titlebutton.close { background-color: #E0784F; color: #FFFFFF; }
+window.dash headerbar button.titlebutton.close:hover { background-color: #F08A60; }
+.banner { background-image: linear-gradient(135deg, #E8855A, #B0432A); border-radius: 16px;
+    padding: 16px 16px 14px 16px; color: #FFFFFF; box-shadow: 0 6px 22px rgba(224, 120, 79, 0.28); }
+.kicker { font-size: 8.5pt; font-weight: 700; letter-spacing: 1px; color: rgba(255, 255, 255, 0.85); }
+.hero { font-size: 17pt; font-weight: 800; }
+.tile { background-color: rgba(0, 0, 0, 0.20); border-radius: 12px; padding: 8px 10px; }
+.tile-val { font-size: 15pt; font-weight: 800; }
+.tile-key { font-size: 8.5pt; color: rgba(255, 255, 255, 0.85); }
+.section { font-size: 10.5pt; font-weight: 700; color: #F2F2F2; }
+.count { background-color: #2A160E; color: #F0916A; border-radius: 999px; padding: 0 8px;
+    font-size: 8.5pt; font-weight: 700; }
+.card { background-color: #0F0F0F; border: 1px solid #222222; border-left: 4px solid #3A3A3A;
+    border-radius: 14px; padding: 12px 14px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.6); }
+.card.busy { border-left-color: #4ADE80; }
+.card.idle { border-left-color: #FBBF24; }
+.name { font-size: 12pt; font-weight: 700; color: #F2F2F2; }
+.muted { color: #A3A3A3; }
+.faint { color: #6E6E6E; font-size: 9pt; }
+.pill { border-radius: 999px; padding: 2px 10px; font-size: 8.5pt; font-weight: 700;
+    background-color: #1C1C1C; color: #9A9A9A; }
+.pill.busy { background-color: #0E2A19; color: #4ADE80; }
+.pill.idle { background-color: #2B2210; color: #FBBF24; }
+.chip { background-color: #1A1A1A; color: #D4D4D4; border: 1px solid #2A2A2A; border-radius: 6px;
+    padding: 1px 8px; font-size: 8.5pt; font-weight: 600; font-family: monospace; }
+.pct { font-size: 13pt; font-weight: 800; color: #F2F2F2; }
+.card progressbar trough { min-height: 8px; border-radius: 4px; background-color: #1F1F1F; border: none; }
+.card progressbar progress { min-height: 8px; border-radius: 4px; border: none;
+    background-image: linear-gradient(to right, #22A35A, #4ADE80); }
+.card progressbar.warn progress { background-image: linear-gradient(to right, #D99A12, #FBBF24); }
+.card progressbar.crit progress { background-image: linear-gradient(to right, #C8372D, #F87171); }
+.stat { background-color: #070707; border: 1px solid #1F1F1F; border-radius: 10px; padding: 6px 8px; }
+.stat-val { font-weight: 700; color: #F2F2F2; }
+.stat-key { color: #6E6E6E; font-size: 8pt; }
+button.primary { background-image: none; background-color: #E0784F; color: #FFFFFF; border: none;
+    border-radius: 999px; padding: 4px 16px; font-weight: 700; box-shadow: 0 2px 10px rgba(224, 120, 79, 0.35); }
+button.primary:hover { background-color: #F08A60; }
+button.primary label { color: #FFFFFF; }
+button.icon { background-image: none; background-color: transparent; border: none; box-shadow: none;
+    border-radius: 999px; padding: 4px 6px; color: #A3A3A3; }
+button.icon:hover { background-color: #1F1F1F; color: #FFFFFF; }
+.empty { background-color: #0A0A0A; border: 1px dashed #2A2A2A; border-radius: 14px; padding: 18px; color: #A3A3A3; }
 """
 
 
@@ -435,12 +631,40 @@ def launch_session(r, fork=False):
         print('could not open terminal:', e.message, file=sys.stderr)
 
 
-def _label(cls=None, **kw):
+def apply_theme():
+    # Dark Yaru for this process only, so scrollbars and arrows match the black palette in any mode.
+    st = Gtk.Settings.get_default()
+    st.set_property('gtk-application-prefer-dark-theme', True)
+    if os.path.isdir('/usr/share/themes/Yaru-dark'):
+        st.set_property('gtk-theme-name', 'Yaru-dark')
+    css = Gtk.CssProvider()
+    css.load_from_data(CSS)
+    Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css,
+                                             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+
+def _lbl(*classes, ellipsize=None, wrap=False, **kw):
     lb = Gtk.Label(xalign=0, **kw)
-    lb.set_line_wrap(True)
-    if cls:
-        lb.get_style_context().add_class(cls)
+    lb.set_line_wrap(wrap)
+    if ellipsize:
+        lb.set_ellipsize(ellipsize)
+    _cls(lb, *classes)
     return lb
+
+
+def _cls(widget, *classes):
+    sc = widget.get_style_context()
+    for c in classes:
+        sc.add_class(c)
+    return widget
+
+
+def _box(*children, vertical=False, spacing=0, **kw):
+    b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL if vertical else Gtk.Orientation.HORIZONTAL,
+                spacing=spacing, **kw)
+    for c in children:
+        b.pack_start(c, False, False, 0)
+    return b
 
 
 def _set(widget, markup):
@@ -448,87 +672,120 @@ def _set(widget, markup):
         widget.set_markup(markup)
 
 
+def _icon_btn(icon, tip, cb):
+    b = _cls(Gtk.Button.new_from_icon_name(icon, Gtk.IconSize.BUTTON), 'icon')
+    b.set_tooltip_text(tip)
+    b.connect('clicked', cb)
+    return b
+
+
 class Card(Gtk.Box):
     def __init__(self):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        self.get_style_context().add_class('card')
-        self.row = None
-        top = Gtk.Box(spacing=8)
-        self.name = _label(hexpand=True)
-        self.status = Gtk.Label(xalign=1)
-        top.pack_start(self.name, True, True, 0)
-        top.pack_end(self.status, False, False, 0)
-        self.sub = _label('dim')
-        self.model = _label()
-        self.bar = Gtk.ProgressBar()
-        self.ctx = _label('dim')
-        self.tok = _label()
-        self.time = _label('dim')
-        btns = Gtk.Box(spacing=6)
-        self.open_btn = Gtk.Button(label='Open session')
-        self.open_btn.get_style_context().add_class('suggested-action')
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        _cls(self, 'card')
+        self.row = self._state = None
+        E = Pango.EllipsizeMode
+        self.name = _lbl('name', ellipsize=E.END)
+        self.title = _lbl('muted', ellipsize=E.END, no_show_all=True)
+        self.folder = _lbl('faint', ellipsize=E.MIDDLE)
+        self.pill = _lbl('pill', valign=Gtk.Align.START)
+        names = _box(self.name, self.title, self.folder, vertical=True, spacing=1)
+        top = Gtk.Box(spacing=10)
+        top.pack_start(names, True, True, 0)
+        top.pack_end(self.pill, False, False, 0)
+
+        self.chip = _lbl('chip')
+        self.also = _lbl('faint', ellipsize=E.END, no_show_all=True)
+        models = _box(self.chip, self.also, spacing=8)
+
+        self.bar = Gtk.ProgressBar(valign=Gtk.Align.CENTER, hexpand=True)
+        self.pct = _lbl('pct')
+        ctx = Gtk.Box(spacing=10)
+        ctx.pack_start(self.bar, True, True, 0)
+        ctx.pack_end(self.pct, False, False, 0)
+        self.ctx_note = _lbl('faint')
+
+        stats = Gtk.Box(spacing=6, homogeneous=True)
+        self.stats = []
+        for key in ('Input', 'Output', 'Cache read', 'Cache write'):
+            val = _lbl('stat-val')
+            stats.pack_start(_cls(_box(val, _lbl('stat-key', label=key), vertical=True), 'stat'), True, True, 0)
+            self.stats.append(val)
+
+        self.time = _lbl('muted', wrap=True)
+        self.open_btn = _cls(Gtk.Button(label='Open session'), 'primary')
         self.open_btn.connect('clicked', self._resume)
-        btns.pack_start(self.open_btn, False, False, 0)
-        for text, tip, cb in (('Open folder', 'Open the project folder', self._open),
-                              ('⋯', 'Copy resume command', self._copy)):
-            b = Gtk.Button(label=text, relief=Gtk.ReliefStyle.NONE, tooltip_text=tip)
-            b.connect('clicked', cb)
-            btns.pack_start(b, False, False, 0)
-        for w in (top, self.sub, self.model, self.bar, self.ctx, self.tok, self.time, btns):
+        actions = _box(self.open_btn,
+                       _icon_btn('folder-open-symbolic', 'Open project folder', self._open),
+                       _icon_btn('edit-copy-symbolic', 'Copy resume command', self._copy), spacing=4)
+        for w in (top, models, ctx, self.ctx_note, stats, self.time, actions):
             self.pack_start(w, False, False, 0)
         self.show_all()
 
     def set(self, r, now):
         self.row = r
-        color, dot, _ = STATUS.get(r['status'], ('#888888', '●', ''))
-        _set(self.name, f'<b>{esc(r["name"])}</b>' + (f'  <small>{esc(r["title"])}</small>' if r['title'] else ''))
-        _set(self.status, f'<span foreground="{color}">{dot} {esc(r["status"])}</span>')
+        st = r['status'] if r['status'] in STATUS else 'idle'
+        if st != self._state:
+            sc, pc = self.get_style_context(), self.pill.get_style_context()
+            if self._state:
+                sc.remove_class(self._state)
+                pc.remove_class(self._state)
+            sc.add_class(st)
+            pc.add_class(st)
+            self._state = st
         live = r['status'] != 'ended'
-        _set(self.sub, f'<small>{esc(r["cwd"].replace(HOME, "~", 1))}'
-                       + (f' · open in a terminal (PID {r["pid"]})' if live else '') + '</small>')
+        _set(self.name, esc(r['name']))
+        _set(self.title, esc(r['title']))
+        self.title.set_visible(bool(r['title']))
+        _set(self.folder, esc(r['cwd'].replace(HOME, '~', 1))
+             + (f'  ·  PID {r["pid"]}, open in a terminal' if live else ''))
+        _set(self.pill, f'{STATUS[st][1]} {esc(r["status"])}')
+
+        cur = r['model']
+        others = [short_model(m) for m in r['models'] if m != cur]
+        _set(self.chip, esc(short_model(cur)) + (' · 1M' if r['window'] == CTX_1M else ''))
+        _set(self.also, f'also {esc(", ".join(others))}' if others else '')
+        self.also.set_visible(bool(others))
+
+        frac = min(r['ctx'] / r['window'], 1.0)
+        self.bar.set_fraction(frac)
+        bc = self.bar.get_style_context()
+        for cls, on in (('warn', 0.7 <= frac < 0.9), ('crit', frac >= 0.9)):
+            (bc.add_class if on else bc.remove_class)(cls)
+        _set(self.pct, f'{1 - frac:.0%} <span size="small" weight="normal" foreground="#6E6E6E">left</span>')
+        _set(self.ctx_note, f'{fmt_tok(r["ctx"])} of {fmt_tok(r["window"])} context used')
+        for lb, v in zip(self.stats, r['tok']):
+            _set(lb, fmt_tok(v))
+
+        if live:
+            parts = [f'Running <b>{fmt_dur(now - r["started"]) if r["started"] else "?"}</b>',
+                     f'Active <b>{fmt_dur(r["active"])}</b>']
+            if r['last']:
+                parts.append(f'Last message {fmt_dur(now - r["last"])} ago')
+        else:
+            parts = [f'Active <b>{fmt_dur(r["active"])}</b>']
+            if r['last']:
+                parts.append(f'Last used {fmt_dur(now - r["last"])} ago')
+        if r['api_ms']:
+            parts.append(f'API {fmt_dur(r["api_ms"] / 1000)}')
+        if r['cost']:
+            parts.append(f'<b>${r["cost"]:.2f}</b>')
+        _set(self.time, f'<small>{"  ·  ".join(parts)}</small>')
+
         label = 'Open copy' if live else 'Open session'
         if self.open_btn.get_label() != label:
             self.open_btn.set_label(label)
             self.open_btn.set_tooltip_text(
                 'Already running elsewhere: opens a forked copy with the full history in a new terminal'
                 if live else 'Resume this session in a new terminal')
-        cur = r['model']
-        others = [short_model(m) for m in r['models'] if m != cur]
-        _set(self.model, f'Model: <b>{esc(short_model(cur))}</b>'
-                         + (' (1M ctx)' if r['window'] == CTX_1M else '')
-                         + (f'  <small>also: {esc(", ".join(others))}</small>' if others else ''))
-        frac = min(r['ctx'] / r['window'], 1.0)
-        self.bar.set_fraction(frac)
-        sc = self.bar.get_style_context()
-        for cls, on in (('warn', 0.7 <= frac < 0.9), ('crit', frac >= 0.9)):
-            (sc.add_class if on else sc.remove_class)(cls)
-        _set(self.ctx, f'<small>Context: {fmt_tok(r["ctx"])} / {fmt_tok(r["window"])} used · '
-                       f'<b>{1 - frac:.0%} left</b></small>')
-        i, o, cr, cw = r['tok']
-        _set(self.tok, f'Tokens: in {fmt_tok(i)} · out <b>{fmt_tok(o)}</b> · '
-                       f'cache read {fmt_tok(cr)} · cache write {fmt_tok(cw)}')
-        if r['status'] == 'ended':
-            parts = [f'Active {fmt_dur(r["active"])}']
-            if r['last']:
-                parts.append(f'last used {fmt_dur(now - r["last"])} ago')
-        else:
-            parts = [f'Running {fmt_dur(now - r["started"]) if r["started"] else "?"}',
-                     f'active {fmt_dur(r["active"])}']
-            if r['last']:
-                parts.append(f'last message {fmt_dur(now - r["last"])} ago')
-        if r['api_ms']:
-            parts.append(f'API {fmt_dur(r["api_ms"] / 1000)}')
-        if r['cost']:
-            parts.append(f'${r["cost"]:.2f}')
-        _set(self.time, f'<small>{" · ".join(parts)}</small>')
-
-    def _open(self, _b):
-        if self.row and os.path.isdir(self.row['cwd']):
-            Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(self.row['cwd']), None)
 
     def _resume(self, _b):
         if self.row:
             launch_session(self.row, fork=self.row['status'] != 'ended')
+
+    def _open(self, _b):
+        if self.row and os.path.isdir(self.row['cwd']):
+            Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(self.row['cwd']), None)
 
     def _copy(self, _b):
         if self.row:
@@ -536,35 +793,62 @@ class Card(Gtk.Box):
             Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(cmd, -1)
 
 
+def _section(title):
+    count = _lbl('count', valign=Gtk.Align.CENTER)
+    return _box(_lbl('section', label=title), count, spacing=8), count
+
+
 class Dashboard(Gtk.Window):
-    def __init__(self):
+    def __init__(self, on_refresh):
         super().__init__(title='Claude sessions')
-        self.set_default_size(500, 680)
+        _cls(self, 'dash')
+        self.set_default_size(540, 760)
         self.connect('delete-event', lambda w, _e: w.hide() or True)   # closing only hides
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=14)
-        self.header = _label()
-        self.live_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        self.empty = _label('dim', label='No running sessions')
-        self.ended_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=8)
-        exp = Gtk.Expander(label='Recently ended')
+        self.connect('key-press-event', lambda w, e: e.keyval == Gdk.KEY_Escape and (w.hide() or True))
+        hb = Gtk.HeaderBar(title='Claude sessions', subtitle='Live · updates automatically',
+                           show_close_button=True)
+        hb.pack_end(_icon_btn('view-refresh-symbolic', 'Refresh now', lambda *_: on_refresh()))
+        hb.show_all()                    # titlebar isn't covered by the content's show_all()
+        self.set_titlebar(hb)
+
+        tiles = Gtk.Box(spacing=8, homogeneous=True)
+        self.tiles = {}
+        for key, name in (('running', 'Running'), ('busy', 'Busy'), ('today', 'Today tokens'),
+                          ('cache', 'Cache reads')):
+            val = _lbl('tile-val')
+            tiles.pack_start(_cls(_box(val, _lbl('tile-key', label=name), vertical=True), 'tile'), True, True, 0)
+            self.tiles[key] = val
+        banner = _cls(_box(_lbl('kicker', label='CLAUDE CODE'), _lbl('hero', label='Your sessions'),
+                           vertical=True, spacing=2), 'banner')
+        banner.pack_start(tiles, False, False, 10)
+
+        live_head, self.live_count = _section('Running')
+        self.live_box = _box(vertical=True, spacing=10)
+        self.empty = _lbl('empty', wrap=True, label='No running sessions. Start one by running claude in a terminal.')
+        ended_head, self.ended_count = _section('Recently ended')
+        self.ended_box = _box(vertical=True, spacing=10, margin_top=10)
+        exp = Gtk.Expander(expanded=True)
+        exp.set_label_widget(ended_head)
         exp.add(self.ended_box)
-        note = _label('dim', label='<small>Plan usage limits (5-hour / weekly) are not stored locally; '
-                                   'run /usage inside Claude Code to see them.</small>', use_markup=True)
-        for w in (self.header, self.empty, self.live_box, exp, note):
-            root.pack_start(w, False, False, 0)
+        note = _lbl('faint', wrap=True, label='Plan usage limits (5-hour / weekly) are not stored locally. '
+                                              'Run /usage inside Claude Code to see them.')
+        root = _cls(_box(banner, live_head, self.empty, self.live_box, exp, note,
+                         vertical=True, spacing=12, margin=16), 'content')
         sw = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
         sw.add(root)
         self.add(sw)
         self.cards = {self.live_box: {}, self.ended_box: {}}
+        self._seeded = set()             # boxes filled once; later cards slide in
         sw.show_all()
 
     def update(self, snap, now):
         live = snap['live']
-        busy = sum(r['status'] == 'busy' for r in live)
         io, cr = snap['today']
-        _set(self.header, f'<big><b>{len(live)} running</b></big> · {busy} busy\n'
-                          f'<small>Today: <b>{fmt_tok(io)}</b> tokens in/out/cache-write · '
-                          f'{fmt_tok(cr)} cache reads</small>')
+        for key, v in (('running', str(len(live))), ('busy', str(sum(r['status'] == 'busy' for r in live))),
+                       ('today', fmt_tok(io)), ('cache', fmt_tok(cr))):
+            _set(self.tiles[key], v)
+        _set(self.live_count, str(len(live)))
+        _set(self.ended_count, str(len(snap['ended'])))
         self.empty.set_visible(not live)
         self._sync(self.live_box, live, now)
         self._sync(self.ended_box, snap['ended'], now)
@@ -574,33 +858,41 @@ class Dashboard(Gtk.Window):
         cards = self.cards[box]
         want = {r['sid'] for r in rows}
         for sid in list(cards.keys() - want):
-            cards.pop(sid).destroy()
+            cards.pop(sid).get_parent().destroy()
+        slide = box in self._seeded
         for i, r in enumerate(rows):
             c = cards.get(r['sid'])
             if c is None:
                 c = cards[r['sid']] = Card()
-                box.pack_start(c, False, False, 0)
-            box.reorder_child(c, i)
+                rev = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN,
+                                   transition_duration=280, reveal_child=not slide)
+                rev.add(c)
+                rev.show()
+                box.pack_start(rev, False, False, 0)
+                if slide:
+                    GLib.idle_add(rev.set_reveal_child, True)
+            box.reorder_child(c.get_parent(), i)
             c.set(r, now)
+        self._seeded.add(box)
 
 
 class App:
     def __init__(self):
         self.snap = None
         self._menu_sig = None
-        self._icon = None
+        self._prev = None                # pid -> row from the previous snapshot
+        self._label_msg = self._label_timer = None
         self._write_icons()
-        css = Gtk.CssProvider()
-        css.load_from_data(CSS)
-        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css,
-                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-        self.ind = AI.Indicator.new('claude-tray', 'claude-tray-none',
+        apply_theme()
+        self.ind = AI.Indicator.new('claude-tray', 'claude-tray-none-0',
                                     AI.IndicatorCategory.APPLICATION_STATUS)
         self.ind.set_icon_theme_path(CACHE_DIR)
         self.ind.set_title('Claude sessions')
         self.ind.set_status(AI.IndicatorStatus.ACTIVE)
-        self.win = Dashboard()
+        self.anim = Animator(self.ind)
+        self.notifier = Notifier(lambda: self.show_dashboard())
         self.monitor = Monitor(lambda snap: GLib.idle_add(self.render, snap))
+        self.win = Dashboard(lambda: self.monitor.poke(force=True))
         self._build_menu('Loading…', [])
         try:
             os.makedirs(SESS_DIR, exist_ok=True)
@@ -613,17 +905,17 @@ class App:
 
     @staticmethod
     def _write_icons():
-        for state, color in ICON_COLORS.items():
-            p = os.path.join(CACHE_DIR, f'claude-tray-{state}.svg')
-            svg = ICON_SVG.format(c=color)
-            try:
-                with open(p) as f:
-                    if f.read() == svg:
-                        continue
-            except OSError:
-                pass
-            with open(p, 'w') as f:
-                f.write(svg)
+        for name, frames in ICON_FRAMES.items():
+            for i, svg in enumerate(frames):
+                p = os.path.join(CACHE_DIR, f'claude-tray-{name}-{i}.svg')
+                try:
+                    with open(p) as f:
+                        if f.read() == svg:
+                            continue
+                except OSError:
+                    pass
+                with open(p, 'w') as f:
+                    f.write(svg)
 
     def _tick(self):
         if self.snap:
@@ -635,11 +927,9 @@ class App:
         now = time.time()
         live = snap['live']
         busy = sum(r['status'] == 'busy' for r in live)
-        icon = 'busy' if busy else 'idle' if live else 'none'
-        if icon != self._icon:
-            self._icon = icon
-            self.ind.set_icon_full(f'claude-tray-{icon}', f'Claude: {icon}')
-        self.ind.set_label(str(len(live)) if live else '', '99')
+        self._animate(live)
+        self.anim.set_rest('busy' if busy else 'idle' if live else 'none', bool(busy))
+        self._update_label()
         lines = []
         for r in live:
             left = 1 - min(r['ctx'] / r['window'], 1.0)
@@ -653,6 +943,57 @@ class App:
         if self.win.get_visible():
             self.win.update(snap, now)
         return False
+
+    def _update_label(self):
+        n = len(self.snap['live']) if self.snap else 0
+        self.ind.set_label(self._label_msg or (str(n) if n else ''), '99')
+
+    def _flash_label(self, text):
+        if self._label_timer:
+            GLib.source_remove(self._label_timer)
+        self._label_msg = text
+        self._label_timer = GLib.timeout_add_seconds(LABEL_FLASH_S, self._clear_label)
+        self._update_label()
+
+    def _clear_label(self):
+        self._label_msg = self._label_timer = None
+        self._update_label()
+        return False
+
+    def _animate(self, live):
+        # Keyed by PID: a session's id can change on /clear, its process can't.
+        cur = {r['pid']: r for r in live}
+        prev, self._prev = self._prev, cur
+        if prev is None:                         # no events for what was already open at startup
+            return
+        msg = None
+        for pid in cur.keys() - prev.keys():
+            self.anim.play('spawn')
+            msg = f'+ {cur[pid]["name"]} started'
+        for pid, r in cur.items():
+            old = prev.get(pid)
+            if old and old['status'] == 'busy' and r['status'] != 'busy':
+                self.anim.play('done')
+                msg = f'✓ {r["name"]} done'
+                self._notify_done(old, r)
+        for pid in prev.keys() - cur.keys():
+            self.anim.play('close')
+            msg = f'✕ {prev[pid]["name"]} closed'
+        if msg:
+            self._flash_label(msg)
+
+    def _notify_done(self, old, r):
+        # statusUpdatedAt marks when each status began, so the busy span is the gap between them.
+        took = (r['since'] or time.time()) - (old['since'] or time.time())
+        if took < NOTIFY_MIN_S:
+            return
+        waiting = r['status'] != 'idle'
+        title = f'{"⏳" if waiting else "✅"} {r["name"]} {"needs attention" if waiting else "finished"}'
+        left = 1 - min(r['ctx'] / r['window'], 1.0)
+        dur = f'{int(took // 60)}m {int(took % 60):02d}s' if 60 <= took < 600 else fmt_dur(took)
+        body = (f'Took {dur} · {short_model(r["model"])} · {left:.0%} context left · '
+                f'{r["cwd"].replace(HOME, "~", 1)}')
+        self.notifier.notify(r['sid'], title, body, os.path.join(CACHE_DIR, 'claude-tray-done-4.svg'))
 
     def _build_menu(self, header, lines, ended=()):
         sig = (header, tuple(lines), tuple((t, r['sid']) for t, r in ended))
