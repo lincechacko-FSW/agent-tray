@@ -27,6 +27,8 @@ The icon appears in the top bar. Click it to see your sessions.
   | New session opens | Badge pops in, spark spins with a flash | `+ poc-28 started` |
   | Session finishes a task | Whole icon turns green with a big ✓ and pulses | `✓ poc-28 done` |
   | Session closed | Grey icon with a big ✕ that fades out | `✕ poc-28 closed` |
+  | Context 80% used | Amber icon with a big **!** that pulses | `⚠ poc-28 ctx 82%` |
+  | Context 95% used | Red icon with a big **!** that pulses | `⚠ poc-28 ctx 96%` |
   | Any session busy | Slow breathing glow + green dot | |
 
 - **Starts at login** automatically.
@@ -40,6 +42,18 @@ Took 2m 14s · opus-5-5 · 84% context left · ~/POC      [Open dashboard]
 - It only appears for tasks that ran **10 seconds or longer**, so quick replies don't spam you.
 - A new popup for the same session replaces the previous one.
 - If Claude stops to wait for you (e.g. a permission prompt), it says `⏳ poc-28 needs attention`.
+
+### Popup when context is filling up
+A silent popup warns you before a session runs out of context:
+
+| Level | When | Popup |
+|---|---|---|
+| ⚠️ Warning | 80% of context used | `⚠️ poc-28 context 82% full` · `820k of 1M used · consider /compact soon` |
+| 🔴 Full | 95% used | `🔴 poc-28 context almost full` · `960k of 1M used · run /compact or start a new session` |
+
+- Each level fires **once per session**. It won't repeat while usage goes up and down.
+- After `/compact` or `/clear` drops usage below **70%**, the warnings reset and can fire again.
+- A session that is already near full when the app starts gets a popup right away.
 
 ### Tray menu (click the icon)
 - A summary line: `2 running · 1 busy · today 815k tokens`
@@ -139,6 +153,9 @@ Edit these constants in `claude_tray.py` (search for the name), then restart the
 |---|---|---|
 | `NOTIFY_MIN_S` | `10` | Only show a popup for tasks that ran at least this many seconds |
 | `LABEL_FLASH_S` | `4` | Seconds the event text stays next to the icon |
+| `CTX_WARN` | `0.80` | Context used (fraction) that triggers the ⚠️ warning popup |
+| `CTX_FULL` | `0.95` | Context used (fraction) that triggers the 🔴 almost-full popup |
+| `CTX_REARM` | `0.70` | Warnings reset once context used drops below this |
 | `POLL_S` | `3` | Seconds between checks of live sessions |
 | `SLOW_S` | `30` | Seconds between rescans for ended sessions and today's totals |
 | `IDLE_GAP_S` | `300` | Gaps between messages longer than this don't count as active time |

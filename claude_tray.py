@@ -378,15 +378,19 @@ gi.require_version('AyatanaAppIndicator3', '0.1')
 from gi.repository import AyatanaAppIndicator3 as AI, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 
 ORANGE, GREY, GREEN_BG, GREEN = ('#F0A077', '#C95F3C'), ('#B9B5AD', '#77736B'), ('#5BE38F', '#1C9A52'), '#34C26E'
-ANIM_MS = {'spawn': 80, 'done': 120, 'close': 110, 'breathe': 500}
+AMBER, RED = ('#FCD34D', '#D97706'), ('#F87171', '#B91C1C')
+ANIM_MS = {'spawn': 80, 'done': 120, 'close': 110, 'warn': 110, 'full': 110, 'breathe': 500}
 NOTIFY_MIN_S = 10     # only popup for tasks that ran at least this long
 LABEL_FLASH_S = 4     # how long an event message stays next to the icon
+CTX_WARN, CTX_FULL = 0.80, 0.95   # context-used fractions that trigger a warning / "almost full" popup
+CTX_REARM = 0.70      # warnings reset once usage drops below this (after /compact or /clear)
 
 GLYPHS = {
     'spark': ''.join(f'<line x1="16" y1="5.5" x2="16" y2="26.5" transform="rotate({a} 16 16)"/>'
                      for a in (0, 45, 90, 135)),
     'check': '<path d="M8 16.8 L13.2 22 L24 10.4" fill="none" stroke-linejoin="round"/>',
     'cross': '<path d="M10 10 L22 22 M22 10 L10 22"/>',
+    'bang': '<path d="M16 7.5 L16 18"/><path d="M16 24.4 L16 24.5"/>',
 }
 
 
@@ -432,6 +436,11 @@ def icon_frames():
         'close': [icon_svg(GREY, 'cross', pop=p, scale=s, fade=f) for p, s, f in
                   ((.6, .6, 1), (.85, 1.1, 1), (1, 1, 1), (1, 1, 1), (1, 1, 1), (1, 1, .85), (1, 1, .7),
                    (1, 1, .55), (1, 1, .4))],
+        # context filling up: amber (warning) or red (full) badge with a big "!" that pulses
+        **{name: [icon_svg(grad, 'bang', pop=p, scale=s, flash=f) for p, s, f in
+                  ((.55, .5, 0), (.75, .8, 0), (.95, 1.15, 0), (1, 1.05, 0), (1, 1, 0), (1, 1, .45), (1, 1, 0),
+                   (1, 1, .45), (1, 1, 0), (1, 1, 0), (1, 1, 0), (1, 1, 0))]
+           for name, grad in (('warn', AMBER), ('full', RED))},
         'breathe': [icon_svg(scale=s, dot=GREEN, dot_a=a) for s, a in
                     ((1.0, 1.0), (1.07, .75), (1.12, .5), (1.07, .75))],
     }
@@ -882,6 +891,7 @@ class App:
         self._menu_sig = None
         self._prev = None                # pid -> row from the previous snapshot
         self._label_msg = self._label_timer = None
+        self._ctx_level = {}             # pid -> highest context warning sent (0 none, 1 warn, 2 full)
         self._write_icons()
         apply_theme()
         self.ind = AI.Indicator.new('claude-tray', 'claude-tray-none-0',
@@ -964,6 +974,7 @@ class App:
         # Keyed by PID: a session's id can change on /clear, its process can't.
         cur = {r['pid']: r for r in live}
         prev, self._prev = self._prev, cur
+        ctx_msg = self._check_context(live, animate=prev is not None)
         if prev is None:                         # no events for what was already open at startup
             return
         msg = None
@@ -979,8 +990,33 @@ class App:
         for pid in prev.keys() - cur.keys():
             self.anim.play('close')
             msg = f'✕ {prev[pid]["name"]} closed'
+        msg = ' · '.join(m for m in (ctx_msg, msg) if m)
         if msg:
             self._flash_label(msg)
+
+    def _check_context(self, live, animate):
+        # Each level fires once per session; dropping below CTX_REARM (e.g. /compact) re-arms both.
+        levels, msg = {}, None
+        for r in live:
+            pid, used = r['pid'], min(r['ctx'] / r['window'], 1.0)
+            old = self._ctx_level.get(pid, 0)
+            hit = 2 if used >= CTX_FULL else 1 if used >= CTX_WARN else 0
+            new = levels[pid] = 0 if used < CTX_REARM else max(old, hit)
+            if new > old:
+                self._notify_ctx(r, new, used)
+                if animate:
+                    self.anim.play('full' if new == 2 else 'warn')
+                    msg = f'⚠ {r["name"]} ctx {used:.0%}'
+        self._ctx_level = levels
+        return msg
+
+    def _notify_ctx(self, r, level, used):
+        full = level == 2
+        title = f'{"🔴" if full else "⚠️"} {r["name"]} context {"almost full" if full else f"{used:.0%} full"}'
+        tip = 'run /compact or start a new session' if full else 'consider /compact soon'
+        body = f'{fmt_tok(r["ctx"])} of {fmt_tok(r["window"])} used · {tip} · {r["cwd"].replace(HOME, "~", 1)}'
+        icon = os.path.join(CACHE_DIR, f'claude-tray-{"full" if full else "warn"}-4.svg')
+        self.notifier.notify(f'{r["sid"]}:ctx', title, body, icon)
 
     def _notify_done(self, old, r):
         # statusUpdatedAt marks when each status began, so the busy span is the gap between them.
