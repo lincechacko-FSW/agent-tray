@@ -4,7 +4,7 @@ A Linux top-bar indicator for AI coding agents. See your running sessions, the m
 
 Currently supports **Claude Code**. Support for other agents is planned.
 
-> Unofficial community tool. Not affiliated with or endorsed by Anthropic.
+> Unofficial community tool. Not affiliated with or endorsed by Anthropic. The tray icon is a Claude-style spark drawn for this project, not Anthropic's logo.
 
 ## Quick start
 
@@ -14,22 +14,22 @@ cd agent-tray
 bash install.sh
 ```
 
-The icon appears in the top bar. Click it to see your sessions.
+The icon appears in the top bar. Click it to see your sessions. It starts automatically at every login.
 
 ## Features
 
 ### Top-bar icon
-- **Always there:** an orange badge with the number of running sessions next to it. It is grey when nothing is running and has a green dot while any session is busy.
-- **Animated on events:**
+- **Always there:** an orange Claude-style spark in a faint orbit ring on a starry navy badge, with the number of running sessions next to it. It turns grey when nothing is running.
+- **Space-themed animations:**
 
   | Event | Icon | Text next to icon (4 s) |
   |---|---|---|
-  | New session opens | Badge pops in, spark spins with a flash | `+ poc-28 started` |
-  | Session finishes a task | Whole icon turns green with a big ✓ and pulses | `✓ poc-28 done` |
-  | Session closed | Grey icon with a big ✕ that fades out | `✕ poc-28 closed` |
+  | New session opens | 🚀 A rocket launches through streaking stars, then the spark spins in | `🚀 poc-28 launched` |
+  | Any session busy | 🛰 A glowing satellite orbits the spark while the stars twinkle | |
+  | Session finishes a task | ✅ A green planet with a ✓ appears in a starburst ("mission complete") | `✓ poc-28 done` |
+  | Session closed | 🌒 The spark sinks, greys out and fades | `✕ poc-28 closed` |
   | Context 80% used | Amber icon with a big **!** that pulses | `⚠ poc-28 ctx 82%` |
   | Context 95% used | Red icon with a big **!** that pulses | `⚠ poc-28 ctx 96%` |
-  | Any session busy | Slow breathing glow + green dot | |
 
 - **Starts at login** automatically.
 
@@ -56,10 +56,22 @@ A silent popup warns you before a session runs out of context:
 - A session that is already near full when the app starts gets a popup right away.
 
 ### Tray menu (click the icon)
-- A summary line: `2 running · 1 busy · today 815k tokens`
-- One line per running session: `🟢 poc-28 — busy · opus-5-5 · ctx 84% left · 46m`
-- **Open session ▸** submenu to resume a recently ended session
-- **Open dashboard…**, **Refresh** and **Quit**
+```
+ ✳️  Claude Code — 2 running · 1 busy
+     Today 815k tokens · 8.6M cached
+ ─────────────────────────────────────
+ ◔  poc-28        ⚡ busy · 46m          ▸   🧠  opus-5-5 · 1M context
+ ◕  gyrodriver    💤 idle · 2h 07m       ▸   ▰▰▰▰▰▰▰▰▱▱  84% context left
+ ─────────────────────────────────────       ⬆ 58 in · ⬇ 45k out · 2M cached
+ ↺  Resume a past session                ▸   ⏱  running 46m · active 38m
+ ▦  Open dashboard…                          ────────────
+ ↻  Refresh                                  ▶  Open copy in terminal
+ ─────────────────────────────────────       📁  Open folder
+ ⏻  Quit                                     📋  Copy resume command
+```
+- Each session has a **ring gauge icon** that fills with context used: green while busy, amber while idle.
+- Hover over a session to see its model, context bar, tokens and time, plus quick actions.
+- **Resume a past session ▸** lists the last 10 ended sessions. Click one to reopen it in a terminal.
 
 ### Dashboard
 A black window with an orange gradient header showing **Running**, **Busy**, **Today tokens** and **Cache reads**. It has one card per session. New cards slide in.
@@ -80,10 +92,24 @@ Sessions are split into **Running** and **Recently ended** (the last 10).
 ### Light on resources
 - Reads only the lines added to session files since the last check
 - Watches the sessions folder for changes (inotify), so it updates the moment a session starts or stops
-- Redraws only when something changed, and animation timers only run during an animation
+- Redraws only when something changed. Animation timers only run during an event animation or while a session is busy (the orbit), so the app uses no CPU when idle
 - No pip dependencies
 
-## Requirements
+### Private by design
+- Reads only the files Claude Code already saves in `~/.claude/`
+- Makes no network requests and uses **no tokens**
+- Session data never leaves your machine
+
+## Supported systems
+
+| System | Status |
+|---|---|
+| Ubuntu 22.04 / 24.04 (GNOME) | ✅ Tested, everything works |
+| Ubuntu 25.04+ | ⚠️ Works, but **Open session** needs `gnome-terminal` (`sudo apt install gnome-terminal`), because the default terminal there is Ptyxis |
+| Other GNOME distros (Fedora, Arch…) | ⚠️ Install the tray library and the AppIndicator extension yourself; `install.sh` only supports `apt` |
+| KDE / XFCE / Cinnamon / MATE | ⚠️ Icon, menu and popups should work; **Open session** needs `gnome-terminal` installed |
+
+### Requirements
 
 - Linux with a desktop that shows AppIndicator / StatusNotifier tray icons. Tested on **Ubuntu 24.04 (GNOME, Wayland)**.
   - GNOME needs the **AppIndicator** extension. Ubuntu has it enabled by default (`ubuntu-appindicators@ubuntu.com`).
@@ -116,16 +142,17 @@ bash install.sh
 |---|---|
 | Start | `claude-tray`, or open **Claude Tray** from the app menu |
 | See sessions | Click the icon in the top bar |
+| See one session's details | Icon menu, then hover over the session |
 | Open the dashboard | Icon menu, then **Open dashboard…**; or middle-click the icon; or click **Open dashboard** on a popup |
 | Close the dashboard | ✕ at the top-right, or press **Esc** (the icon stays in the top bar) |
-| Resume an ended session | **Open session** on its card, or icon menu, then **Open session ▸** |
-| Open a running session | **Open copy** on its card (forked copy in a new terminal) |
-| Open the project folder | 📁 folder icon on a card |
-| Copy the resume command | 📋 copy icon on a card |
+| Resume an ended session | **Open session** on its card, or icon menu, then **Resume a past session ▸** |
+| Open a running session | **Open copy** on its card, or icon menu, then session, then **Open copy in terminal** (a forked copy) |
+| Open the project folder | 📁 on a card, or icon menu, then session, then **Open folder** |
+| Copy the resume command | 📋 on a card, or icon menu, then session, then **Copy resume command** |
 | Refresh now | ↻ in the dashboard title bar, or icon menu, then **Refresh** |
 | Stop | Icon menu, then **Quit** |
 
-Closing the terminal you started it from doesn't stop the app, and starting it twice won't add a second icon.
+Closing the terminal you started it from doesn't stop the app, and starting it twice won't add a second icon. Resume terminals always open as new windows, whichever way the app was started.
 
 ### Command-line options
 
@@ -160,7 +187,7 @@ Edit these constants in `claude_tray.py` (search for the name), then restart the
 | `SLOW_S` | `30` | Seconds between rescans for ended sessions and today's totals |
 | `IDLE_GAP_S` | `300` | Gaps between messages longer than this don't count as active time |
 | `ENDED_SHOWN` | `10` | Number of recently ended sessions to list |
-| `ANIM_MS` | see file | Frame speed of each icon animation in milliseconds |
+| `ANIM_MS` | see file | Frame speed of each icon animation in milliseconds (`orbit` = busy satellite, default 200) |
 
 ## What the numbers mean
 
@@ -195,6 +222,7 @@ rm -rf ~/.cache/claude-tray
 - **`Namespace AyatanaAppIndicator3 not available`:** run `sudo apt install gir1.2-ayatanaappindicator3-0.1`.
 - **No popups:** check that **Do Not Disturb** is off, and that the task ran longer than `NOTIFY_MIN_S` seconds.
 - **"Already running" but no icon, or after an update:** run `pkill -f "^(/usr/bin/)?python3 .*claude[-_]tray"; claude-tray`.
+- **Open session does nothing:** check that `gnome-terminal` is installed (`which gnome-terminal`), then look in `~/.cache/claude-tray/claude-tray.log` for the error.
 - **Resume says the conversation was not found:** the project folder was moved or deleted, and Claude Code finds sessions by folder.
 - **Anything else:** run `claude-tray --foreground` to see errors in the terminal. Quit the running copy first.
 
@@ -202,3 +230,5 @@ rm -rf ~/.cache/claude-tray
 
 - Rename the command to `agent-tray` and split the Claude-specific code into a provider module
 - More providers (other AI coding CLIs)
+- Support more terminals (Ptyxis, Konsole, xfce4-terminal, Kitty…) for **Open session**
+- `install.sh` support for `dnf` and `pacman`

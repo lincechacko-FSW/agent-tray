@@ -3,6 +3,7 @@
 import fcntl
 import glob
 import json
+import math
 import os
 import re
 import shlex
@@ -369,29 +370,33 @@ if __name__ == '__main__':
     _LOCK = _single_instance()
     if '--foreground' not in sys.argv:
         _detach()
+    # Inherited from a terminal tab; gnome-terminal would try to attach new windows to that (maybe closed) tab.
+    for _k in ('GNOME_TERMINAL_SCREEN', 'GNOME_TERMINAL_SERVICE'):
+        os.environ.pop(_k, None)
 
 import gi  # noqa: E402  (imported after fork so the child owns the display connection)
 gi.require_version('Gtk', '3.0')
 gi.require_version('Gdk', '3.0')
 gi.require_version('Pango', '1.0')
+gi.require_version('GdkPixbuf', '2.0')
 gi.require_version('AyatanaAppIndicator3', '0.1')
-from gi.repository import AyatanaAppIndicator3 as AI, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
+from gi.repository import AyatanaAppIndicator3 as AI, Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango  # noqa: E402
 
-ORANGE, GREY, GREEN_BG, GREEN = ('#F0A077', '#C95F3C'), ('#B9B5AD', '#77736B'), ('#5BE38F', '#1C9A52'), '#34C26E'
+NAVY, DUSK = ('#2B4A86', '#0A1026'), ('#3B4150', '#181B22')
+SPARK, SPARK_GREY, PLANET_GREEN = '#E8835C', '#A3A8B3', ('#7CF2A8', '#1C9A52')
+RING, RING_GREY, SAT_GLOW = '#FFDCC8', '#9CA3AF', '#6FF7E0'
 AMBER, RED = ('#FCD34D', '#D97706'), ('#F87171', '#B91C1C')
-ANIM_MS = {'spawn': 80, 'done': 120, 'close': 110, 'warn': 110, 'full': 110, 'breathe': 500}
+ANIM_MS = {'spawn': 85, 'done': 120, 'close': 110, 'warn': 110, 'full': 110, 'orbit': 200}
 NOTIFY_MIN_S = 10     # only popup for tasks that ran at least this long
 LABEL_FLASH_S = 4     # how long an event message stays next to the icon
 CTX_WARN, CTX_FULL = 0.80, 0.95   # context-used fractions that trigger a warning / "almost full" popup
 CTX_REARM = 0.70      # warnings reset once usage drops below this (after /compact or /clear)
 
-GLYPHS = {
-    'spark': ''.join(f'<line x1="16" y1="5.5" x2="16" y2="26.5" transform="rotate({a} 16 16)"/>'
-                     for a in (0, 45, 90, 135)),
-    'check': '<path d="M8 16.8 L13.2 22 L24 10.4" fill="none" stroke-linejoin="round"/>',
-    'cross': '<path d="M10 10 L22 22 M22 10 L10 22"/>',
-    'bang': '<path d="M16 7.5 L16 18"/><path d="M16 24.4 L16 24.5"/>',
-}
+STARS = ((5.5, 6, 1.0), (26.5, 5, .8), (4.8, 24.5, .7), (27.5, 26.5, .9), (15.5, 3.2, .6), (21.5, 29.2, .6))
+ORBIT_RX, ORBIT_RY = 13, 4.2
+ROCKET = ('<path d="M-2.2 1.8 L-4.4 6 L-2 5 Z M2.2 1.8 L4.4 6 L2 5 Z" fill="#E8855A"/>'
+          '<path d="M0 -7.5 C3.2 -4.5 3.2 2 2.2 5 L-2.2 5 C-3.2 2 -3.2 -4.5 0 -7.5 Z" fill="#fff"/>'
+          '<circle cx="0" cy="-1.8" r="1.4" fill="#5AB0FF"/>')
 
 
 def _mix(a, b, t):
@@ -399,51 +404,136 @@ def _mix(a, b, t):
     return '#%02x%02x%02x' % tuple(round(x + (y - x) * t) for x, y in zip(pa, pb))
 
 
-def icon_svg(grad=ORANGE, glyph='spark', scale=1.0, rot=0.0, pop=1.0, flash=0.0, fade=1.0, dot=None, dot_a=1.0):
-    """Edge-to-edge badge with a bold white glyph; pop scales the badge, scale/rot the glyph."""
-    s = ['<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">'
-         '<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
-         f'<stop offset="0" stop-color="{grad[0]}"/><stop offset="1" stop-color="{grad[1]}"/>'
-         f'</linearGradient></defs><g opacity="{fade:.2f}" '
-         f'transform="translate(16 16) scale({pop:.3f}) translate(-16 -16)">'
-         '<rect x="0" y="0" width="32" height="32" rx="8" fill="url(#g)"/>']
-    if flash:
-        s.append(f'<rect x="0" y="0" width="32" height="32" rx="8" fill="#fff" opacity="{flash:.2f}"/>')
-    s.append(f'<g stroke="#fff" stroke-width="4.4" stroke-linecap="round" '
-             f'transform="translate(16 16) rotate({rot:.1f}) scale({scale:.3f}) translate(-16 -16)">'
-             f'{GLYPHS[glyph]}</g></g>')
-    if dot:
-        s.append(f'<circle cx="25" cy="25" r="6.5" fill="{dot}" stroke="#111" stroke-width="1.8" '
-                 f'opacity="{dot_a:.2f}"/>')
+def _grad(gid, c, x2=1, y2=1):
+    return (f'<linearGradient id="{gid}" x1="0" y1="0" x2="{x2}" y2="{y2}">'
+            f'<stop offset="0" stop-color="{c[0]}"/><stop offset="1" stop-color="{c[1]}"/></linearGradient>')
+
+
+def _stars(twinkle, dim, warp):
+    # twinkle=None keeps stars steady; warp stretches them into streaks during a launch.
+    out = []
+    for i, (x, y, r) in enumerate(STARS):
+        a = (.75 if twinkle is None else .3 + .7 * ((i + twinkle) % 3 == 0)) * dim
+        if warp:
+            out.append(f'<line x1="{x}" y1="{y}" x2="{x}" y2="{y + 5 * warp:.1f}" stroke="#fff" '
+                       f'stroke-width="{r:.2f}" stroke-linecap="round" opacity="{a:.2f}"/>')
+        else:
+            out.append(f'<circle cx="{x}" cy="{y}" r="{r:.2f}" fill="#fff" opacity="{a:.2f}"/>')
+    return ''.join(out)
+
+
+def _satellite(theta):
+    # Glowing satellite plus a fading trail, in the orbit's own (untilted) coordinates.
+    out = []
+    for k, (a, r) in enumerate(((.18, 1.0), (.35, 1.3), (1.0, 1.9))):
+        t = theta - (2 - k) * .32
+        x, y = ORBIT_RX * math.cos(t), ORBIT_RY * math.sin(t)
+        if k == 2:
+            out.append(f'<circle cx="{x:.2f}" cy="{y:.2f}" r="3.4" fill="{SAT_GLOW}" opacity=".35"/>')
+        out.append(f'<circle cx="{x:.2f}" cy="{y:.2f}" r="{r}" fill="{SAT_GLOW if k < 2 else "#fff"}" '
+                   f'opacity="{a:.2f}"/>')
+    return ''.join(out)
+
+
+def _spark(color):
+    # Claude-style starburst: ten rounded rays of alternating length around a solid core.
+    rays = ''.join(f'<line x1="0" y1="-2" x2="0" y2="{-ln}" transform="rotate({i * 36})"/>'
+                   for i, ln in enumerate((10.2, 8.4) * 5))
+    return (f'<g stroke="{color}" stroke-width="2.7" stroke-linecap="round">{rays}'
+            f'<circle r="2.4" fill="{color}" stroke="none"/></g>')
+
+
+def space_svg(bg=NAVY, body=SPARK, ring=RING, scale=1.0, rot=0.0, dy=0.0, fade=1.0, sat=None, check=False,
+              rocket=None, flame=1.0, warp=0.0, burst=None, twinkle=None, dim=1.0):
+    """Starry badge with the spark in a faint orbit; extras: satellite, rocket, green check planet, starburst."""
+    s = ['<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32"><defs>',
+         _grad('bg', bg, 0.4, 1), _grad('p', PLANET_GREEN), '</defs>',
+         '<rect x="0" y="0" width="32" height="32" rx="8" fill="url(#bg)"/>', _stars(twinkle, dim, warp)]
+    if body:
+        orbit = '<g transform="rotate(-20)">'
+        behind = sat is not None and math.sin(sat) < 0
+        s.append(f'<g opacity="{fade:.2f}" transform="translate(16 {16 + dy:.2f}) scale({scale:.3f})">'
+                 f'{orbit}<ellipse rx="{ORBIT_RX}" ry="{ORBIT_RY}" fill="none" stroke="{ring}" stroke-width="1.3" '
+                 f'opacity=".4"/>{_satellite(sat) if behind else ""}</g>')
+        if check:
+            s.append('<circle r="7.6" fill="url(#p)"/><circle cx="-2.4" cy="-2.6" r="2.3" fill="#fff" opacity=".28"/>'
+                     '<path d="M-3.8 0.2 L-1.1 3 L4 -2.6" fill="none" stroke="#fff" stroke-width="2.4" '
+                     'stroke-linecap="round" stroke-linejoin="round"/>')
+        else:
+            s.append(f'<g transform="rotate({rot:.1f})">{_spark(body)}</g>')
+        s.append(f'{orbit}{_satellite(sat) if sat is not None and not behind else ""}</g></g>')
+    if rocket is not None:
+        s.append(f'<g transform="translate(16 {rocket:.1f}) scale(1.3)">'
+                 f'<path d="M-1.7 5 Q0 {5 + 6 * flame:.1f} 1.7 5 Z" fill="#FFC04D"/>'
+                 f'<path d="M-0.9 5 Q0 {5 + 3.5 * flame:.1f} 0.9 5 Z" fill="#FF6B3D"/>{ROCKET}</g>')
+    if burst is not None:
+        # four-point stars bursting outward from the centre
+        for ang in (45, 135, 225, 315):
+            d, z = 9 + 6 * burst, 2.6 * (1 - burst) + .8
+            x, y = 16 + d * math.cos(math.radians(ang)), 16 + d * math.sin(math.radians(ang))
+            s.append(f'<path d="M{x:.1f} {y - z:.1f} L{x + z * .3:.1f} {y - z * .3:.1f} L{x + z:.1f} {y:.1f} '
+                     f'L{x + z * .3:.1f} {y + z * .3:.1f} L{x:.1f} {y + z:.1f} L{x - z * .3:.1f} {y + z * .3:.1f} '
+                     f'L{x - z:.1f} {y:.1f} L{x - z * .3:.1f} {y - z * .3:.1f} Z" fill="#FFF3B0" '
+                     f'opacity="{1 - burst * .8:.2f}"/>')
     s.append('</svg>')
     return ''.join(s)
 
 
+def alert_svg(grad, pop=1.0, scale=1.0, flash=0.0):
+    """Full amber/red badge with a bold "!" for context warnings."""
+    s = ['<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32"><defs>',
+         _grad('g', grad), f'</defs><g transform="translate(16 16) scale({pop:.3f}) translate(-16 -16)">'
+         '<rect x="0" y="0" width="32" height="32" rx="8" fill="url(#g)"/>']
+    if flash:
+        s.append(f'<rect x="0" y="0" width="32" height="32" rx="8" fill="#fff" opacity="{flash:.2f}"/>')
+    s.append(f'<g stroke="#fff" stroke-width="4.4" stroke-linecap="round" '
+             f'transform="translate(16 16) scale({scale:.3f}) translate(-16 -16)">'
+             '<path d="M16 7.5 L16 18"/><path d="M16 24.4 L16 24.5"/></g></g></svg>')
+    return ''.join(s)
+
+
+def gauge_svg(status, used):
+    """16px context gauge for menu items: ring fills with context used, coloured by status."""
+    color = {'busy': '#4ADE80', 'idle': '#FBBF24'}.get(status, '#9CA3AF')
+    c = 2 * math.pi * 6
+    return ('<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">'
+            '<circle cx="8" cy="8" r="6" fill="none" stroke="#9CA3AF" stroke-opacity=".35" stroke-width="2.4"/>'
+            f'<circle cx="8" cy="8" r="6" fill="none" stroke="{color}" stroke-width="2.4" stroke-linecap="round" '
+            f'stroke-dasharray="{c * used:.2f} {c:.2f}" transform="rotate(-90 8 8)"/>'
+            f'<circle cx="8" cy="8" r="2.3" fill="{color}"/></svg>')
+
+
 def icon_frames():
+    pulse = ((.55, .5, 0), (.75, .8, 0), (.95, 1.15, 0), (1, 1.05, 0), (1, 1, 0), (1, 1, .45), (1, 1, 0),
+             (1, 1, .45), (1, 1, 0), (1, 1, 0), (1, 1, 0), (1, 1, 0))
     return {
-        'none': [icon_svg(GREY)],
-        'idle': [icon_svg()],
-        'busy': [icon_svg(dot=GREEN)],
-        # new session: badge pops in, spark spins and overshoots under a fading flash
-        'spawn': [icon_svg(pop=p, scale=s, rot=r, flash=f) for p, s, r, f in
-                  ((.55, .4, -90, .7), (.7, .6, -65, .6), (.85, .85, -40, .5), (.95, 1.1, -20, .4),
-                   (1, 1.2, -8, .3), (1, 1.1, 0, .2), (1, 1.0, 0, .1), (1, 1, 0, 0))],
-        # task finished: whole icon turns green with a big check, pulses twice, holds
-        'done': [icon_svg(GREEN_BG, 'check', pop=p, scale=s, flash=f) for p, s, f in
-                 ((.55, .5, 0), (.75, .8, 0), (.95, 1.15, 0), (1, 1.05, 0), (1, 1, 0), (1, 1, .45), (1, 1, 0),
-                  (1, 1, .45), (1, 1, 0), (1, 1, 0), (1, 1, 0), (1, 1, 0), (1, 1, 0))],
-        # session closed: grey badge with a big cross, then fades out
-        'close': [icon_svg(GREY, 'cross', pop=p, scale=s, fade=f) for p, s, f in
-                  ((.6, .6, 1), (.85, 1.1, 1), (1, 1, 1), (1, 1, 1), (1, 1, 1), (1, 1, .85), (1, 1, .7),
-                   (1, 1, .55), (1, 1, .4))],
-        # context filling up: amber (warning) or red (full) badge with a big "!" that pulses
-        **{name: [icon_svg(grad, 'bang', pop=p, scale=s, flash=f) for p, s, f in
-                  ((.55, .5, 0), (.75, .8, 0), (.95, 1.15, 0), (1, 1.05, 0), (1, 1, 0), (1, 1, .45), (1, 1, 0),
-                   (1, 1, .45), (1, 1, 0), (1, 1, 0), (1, 1, 0), (1, 1, 0))]
-           for name, grad in (('warn', AMBER), ('full', RED))},
-        'breathe': [icon_svg(scale=s, dot=GREEN, dot_a=a) for s, a in
-                    ((1.0, 1.0), (1.07, .75), (1.12, .5), (1.07, .75))],
+        'none': [space_svg(DUSK, SPARK_GREY, RING_GREY)],
+        'idle': [space_svg()],
+        'busy': [space_svg(sat=.6)],
+        # busy: a satellite orbits the spark while the stars twinkle
+        'orbit': [space_svg(sat=.6 + 2 * math.pi * i / 12, twinkle=i // 2) for i in range(12)],
+        # new session: rocket launches through streaking stars, then the spark spins in
+        'spawn': [space_svg(body=None, rocket=y, flame=f, warp=w) for y, f, w in
+                  ((33, 1, .3), (26, .75, .6), (19, 1, .9), (12, .75, 1), (5, 1, 1), (-2, .75, .8), (-9, 1, .5))]
+                 + [space_svg(scale=p, rot=r, twinkle=k) for p, r, k in
+                    ((.35, -80, 0), (.7, -45, 1), (1.12, -12, 2), (1, 0, 0))],
+        # task finished: green "mission complete" planet with a check and a starburst
+        'done': [space_svg(check=True, scale=p, burst=t, twinkle=i % 3)
+                 for i, (p, t) in enumerate(((.5, None), (.8, None), (1.15, 0), (1.05, .2), (1, .4), (1, .6),
+                                             (1, .8), (1, None), (1, 0), (1, .35), (1, .7), (1, None), (1, None)))],
+        # session closed: the spark sinks, greys out and fades while the stars dim
+        'close': [space_svg(body=_mix(SPARK, SPARK_GREY, t), ring=_mix(RING, RING_GREY, t), dy=6 * t,
+                            scale=1 - .45 * t, fade=1 - .7 * t, dim=1 - .6 * t) for t in (0, .15, .3, .45, .6, .75, .9, 1)],
+        **{name: [alert_svg(grad, p, s, f) for p, s, f in pulse] for name, grad in (('warn', AMBER), ('full', RED))},
     }
+
+
+def svg_pixbuf(svg, size):
+    ld = GdkPixbuf.PixbufLoader.new_with_type('svg')
+    ld.set_size(size, size)
+    ld.write(svg.encode())
+    ld.close()
+    return ld.get_pixbuf()
 
 
 class Notifier:
@@ -518,7 +608,7 @@ class Animator:
         if self.queue:
             anim, self.loop = self.queue.pop(0), False
         elif self.breathe:
-            anim, self.loop = 'breathe', True
+            anim, self.loop = 'orbit', True
         else:
             self._show(f'{self.rest}-0')
             return
@@ -628,6 +718,20 @@ TERMINAL = shutil.which('gnome-terminal') or 'x-terminal-emulator'
 def resume_cmd(r, fork=False):
     return (f'{shlex.quote(CLAUDE_BIN)} --resume {shlex.quote(r["sid"])}'
             + (' --fork-session' if fork else ''))
+
+
+def open_folder(r):
+    if os.path.isdir(r['cwd']):
+        Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(r['cwd']), None)
+
+
+def copy_resume(r):
+    Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(f'cd {shlex.quote(r["cwd"])} && {resume_cmd(r)}', -1)
+
+
+def ctx_bar(left, n=10):
+    k = round(left * n)
+    return '▰' * k + '▱' * (n - k)
 
 
 def launch_session(r, fork=False):
@@ -793,13 +897,12 @@ class Card(Gtk.Box):
             launch_session(self.row, fork=self.row['status'] != 'ended')
 
     def _open(self, _b):
-        if self.row and os.path.isdir(self.row['cwd']):
-            Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(self.row['cwd']), None)
+        if self.row:
+            open_folder(self.row)
 
     def _copy(self, _b):
         if self.row:
-            cmd = f'cd {shlex.quote(self.row["cwd"])} && {resume_cmd(self.row)}'
-            Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(cmd, -1)
+            copy_resume(self.row)
 
 
 def _section(title):
@@ -903,7 +1006,9 @@ class App:
         self.notifier = Notifier(lambda: self.show_dashboard())
         self.monitor = Monitor(lambda snap: GLib.idle_add(self.render, snap))
         self.win = Dashboard(lambda: self.monitor.poke(force=True))
-        self._build_menu('Loading…', [])
+        self._gauges = {}                # (status, used/20) -> menu icon pixbuf
+        self._logo = svg_pixbuf(ICON_FRAMES['idle'][0], 16)
+        self._build_menu({'live': [], 'ended': [], 'today': [0, 0]}, time.time())
         try:
             os.makedirs(SESS_DIR, exist_ok=True)
             self.fmon = Gio.File.new_for_path(SESS_DIR).monitor_directory(Gio.FileMonitorFlags.NONE, None)
@@ -940,16 +1045,7 @@ class App:
         self._animate(live)
         self.anim.set_rest('busy' if busy else 'idle' if live else 'none', bool(busy))
         self._update_label()
-        lines = []
-        for r in live:
-            left = 1 - min(r['ctx'] / r['window'], 1.0)
-            lines.append(f'{STATUS.get(r["status"], ("", "", "•"))[2]} {r["name"]} — {r["status"]} · '
-                         f'{short_model(r["model"])} · ctx {left:.0%} left · '
-                         f'{fmt_dur(now - r["started"]) if r["started"] else "?"}')
-        io, _ = snap['today']
-        ended = [(f'{r["name"]} — {os.path.basename(r["cwd"]) or "~"}'
-                  + (f' · {fmt_dur(now - r["last"])} ago' if r['last'] else ''), r) for r in snap['ended']]
-        self._build_menu(f'{len(live)} running · {busy} busy · today {fmt_tok(io)} tokens', lines, ended)
+        self._build_menu(snap, now)
         if self.win.get_visible():
             self.win.update(snap, now)
         return False
@@ -980,7 +1076,7 @@ class App:
         msg = None
         for pid in cur.keys() - prev.keys():
             self.anim.play('spawn')
-            msg = f'+ {cur[pid]["name"]} started'
+            msg = f'🚀 {cur[pid]["name"]} launched'
         for pid, r in cur.items():
             old = prev.get(pid)
             if old and old['status'] == 'busy' and r['status'] != 'busy':
@@ -1031,34 +1127,76 @@ class App:
                 f'{r["cwd"].replace(HOME, "~", 1)}')
         self.notifier.notify(r['sid'], title, body, os.path.join(CACHE_DIR, 'claude-tray-done-4.svg'))
 
-    def _build_menu(self, header, lines, ended=()):
-        sig = (header, tuple(lines), tuple((t, r['sid']) for t, r in ended))
+    def _gauge(self, key):
+        g = self._gauges.get(key)
+        if g is None:
+            g = self._gauges[key] = svg_pixbuf(gauge_svg(key[0], key[1] / 20), 16)
+        return g
+
+    def _menu_model(self, snap, now):
+        live = snap['live']
+        busy = sum(r['status'] == 'busy' for r in live)
+        io, cr = snap['today']
+        header = (f'Claude Code — {len(live)} running · {busy} busy', f'Today {fmt_tok(io)} tokens · {fmt_tok(cr)} cached')
+        sessions = []
+        for r in live:
+            used = min(r['ctx'] / r['window'], 1.0)
+            dur = fmt_dur(now - r['started']) if r['started'] else '?'
+            i, o, c_r, _ = r['tok']
+            icon = {'busy': '⚡', 'idle': '💤'}.get(r['status'], '•')
+            sessions.append((r, f'{r["name"]}    {icon} {r["status"]} · {dur}', (
+                f'🧠  {short_model(r["model"])}' + (' · 1M context' if r['window'] == CTX_1M else ''),
+                f'{ctx_bar(1 - used)}  {1 - used:.0%} context left',
+                f'⬆ {fmt_tok(i)} in  ·  ⬇ {fmt_tok(o)} out  ·  {fmt_tok(c_r)} cached',
+                f'⏱  running {dur} · active {fmt_dur(r["active"])}'), (r['status'], round(used * 20))))
+        ended = [(f'{r["name"]} — {os.path.basename(r["cwd"]) or "~"}'
+                  + (f' · {fmt_dur(now - r["last"])} ago' if r['last'] else ''), r) for r in snap['ended']]
+        return header, sessions, ended
+
+    def _build_menu(self, snap, now):
+        header, sessions, ended = self._menu_model(snap, now)
+        sig = (header, tuple((r['sid'], t, d, g) for r, t, d, g in sessions), tuple((t, r['sid']) for t, r in ended))
         if sig == self._menu_sig:        # skip DBus menu churn when nothing changed
             return
         self._menu_sig = sig
         menu = Gtk.Menu()
 
-        def add(label, cb=None, sensitive=True, into=menu):
-            it = Gtk.MenuItem(label=label)
-            it.set_sensitive(sensitive)
+        def add(label, cb=None, icon=None, into=menu):
+            if icon is None:
+                it = Gtk.MenuItem(label=label)
+            else:
+                it = Gtk.ImageMenuItem(label=label, always_show_image=True)
+                it.set_image(Gtk.Image.new_from_pixbuf(icon) if isinstance(icon, GdkPixbuf.Pixbuf)
+                             else Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.MENU))
             if cb:
                 it.connect('activate', cb)
             into.append(it)
             return it
 
-        add(header, sensitive=False)
+        add(header[0], self.show_dashboard, self._logo)
+        add(header[1], self.show_dashboard)
         menu.append(Gtk.SeparatorMenuItem())
-        for ln in lines or ['No running sessions']:
-            add(ln, self.show_dashboard, bool(lines))
+        for r, title, details, gauge in sessions:
+            sub = Gtk.Menu()
+            for d in details:
+                add(d, self.show_dashboard, into=sub)
+            sub.append(Gtk.SeparatorMenuItem())
+            add('▶  Open copy in terminal', lambda _i, r=r: launch_session(r, fork=True), into=sub)
+            add('📁  Open folder', lambda _i, r=r: open_folder(r), into=sub)
+            add('📋  Copy resume command', lambda _i, r=r: copy_resume(r), into=sub)
+            add(title, icon=self._gauge(gauge)).set_submenu(sub)
+        if not sessions:
+            add('🌌  No running sessions', self.show_dashboard)
+        menu.append(Gtk.SeparatorMenuItem())
         if ended:
             sub = Gtk.Menu()
             for text, r in ended:
                 add(text, lambda _i, r=r: launch_session(r), into=sub)
-            add('Open session').set_submenu(sub)
+            add('Resume a past session', icon='document-open-recent-symbolic').set_submenu(sub)
+        dash = add('Open dashboard…', self.show_dashboard, 'view-grid-symbolic')
+        add('Refresh', lambda *_: self.monitor.poke(force=True), 'view-refresh-symbolic')
         menu.append(Gtk.SeparatorMenuItem())
-        dash = add('Open dashboard…', self.show_dashboard)
-        add('Refresh', lambda *_: self.monitor.poke(force=True))
-        add('Quit', lambda *_: Gtk.main_quit())
+        add('Quit', lambda *_: Gtk.main_quit(), 'application-exit-symbolic')
         menu.show_all()
         self.ind.set_menu(menu)
         self.ind.set_secondary_activate_target(dash)    # middle-click opens dashboard
