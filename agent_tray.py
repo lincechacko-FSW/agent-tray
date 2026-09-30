@@ -34,6 +34,7 @@ CODEX_ACTIVE_S = 1800  # a ChatGPT / Codex thread counts as open if used this re
 CODEX_STALE_S = 600    # an unfinished Codex turn with no writes for this long is no longer "busy"
 CODEX_PROC_S = 10      # how often to rescan /proc for the ChatGPT app / codex CLI
 CLAUDE_BUSY_CPU = 0.015  # fallback status: a claude process above this CPU share counts as busy
+CLAUDE_STALE_S = 180  # hook says busy but the process was quiet this long: the turn was interrupted (Esc)
 CLAUDE_SUBCMDS = {'mcp', 'config', 'update', 'doctor', 'install', 'migrate-installer', 'setup-token', 'plugin'}
 CLK_TCK = os.sysconf('SC_CLK_TCK')
 
@@ -191,6 +192,7 @@ class Monitor:
         self.codex = CodexSource(self)
         self._ptab, self._ptime = {}, 0.0
         self._cpu = {}           # fallback claude pid -> (sampled at, cpu ticks, busy, quiet samples, since)
+        self._hook_cache = {}    # hook file -> (mtime_ns, record)
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
@@ -241,9 +243,47 @@ class Monitor:
         self._ptab, self._ptime = tab, now
         return tab
 
+    def _hooks(self, tab):
+        # Hook records for sessions whose claude process is still alive: pid -> record, session id -> record.
+        by_pid, by_sid, seen = {}, {}, set()
+        try:
+            names = os.listdir(HOOK_DIR)
+        except OSError:
+            return by_pid, by_sid
+        for n in names:
+            if not n.endswith('.json'):
+                continue
+            p = os.path.join(HOOK_DIR, n)
+            seen.add(p)
+            try:
+                mt = os.stat(p).st_mtime_ns
+            except OSError:
+                continue
+            c = self._hook_cache.get(p)
+            if c is None or c[0] != mt:
+                try:
+                    with open(p) as f:
+                        c = self._hook_cache[p] = (mt, json.load(f))
+                except (OSError, ValueError):
+                    continue
+            rec = c[1]
+            if rec.get('pid') in tab:
+                by_pid[rec['pid']] = rec
+                by_sid[rec.get('session_id')] = rec
+            elif time.time() - mt / 1e9 > 86400:     # crashed session that never sent SessionEnd
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        for p in self._hook_cache.keys() - seen:
+            del self._hook_cache[p]
+        return by_pid, by_sid
+
     def _fallback(self, known, now):
-        """Claude processes without a sessions/<pid>.json (Claude Code 2.1.285+); busy/idle is estimated."""
+        """Claude processes without a sessions/<pid>.json (Claude Code 2.1.285+): exact status from our hooks,
+        otherwise busy/idle estimated from CPU."""
         tab = self.procs(now)
+        by_pid, by_sid = self._hooks(tab)
         claudes = {pid for pid, v in tab.items() if v[0] == 'claude' and pid not in known}
         # Claude's Bash tool runs `bash -c source …/shell-snapshots/…`, a precise "tool running" signal.
         tools = {v[1] for pid, v in tab.items()
@@ -274,6 +314,17 @@ class Monitor:
             if not sid:                      # plain `claude`: its session is the newest history in that folder
                 hits = glob.glob(os.path.join(PROJ_DIR, re.sub(r'[^A-Za-z0-9]', '-', cwd), '*.jsonl'))
                 sid = os.path.basename(max(hits, key=os.path.getmtime))[:-6] if hits else None
+            rec = by_pid.get(pid) or by_sid.get(sid)
+            if rec:
+                status, stale = rec.get('status', 'idle'), False
+                # Stop doesn't fire on Esc; a long-quiet "busy" is shown idle, flagged estimated so no popup fires.
+                if status == 'busy' and quiet * POLL_S >= CLAUDE_STALE_S and now - rec.get('since', now) >= CLAUDE_STALE_S:
+                    status, stale = 'idle', True
+                out.append({'pid': pid, 'sessionId': rec['session_id'], 'cwd': rec.get('cwd') or cwd,
+                            'startedAt': (BOOT_TIME + start / CLK_TCK) * 1000, 'status': status,
+                            'statusUpdatedAt': rec.get('since', now) * 1000, 'turn_start': rec.get('turn_start'),
+                            'estimated': stale})
+                continue
             out.append({'pid': pid, 'sessionId': sid, 'cwd': cwd, 'startedAt': (BOOT_TIME + start / CLK_TCK) * 1000,
                         'status': 'busy' if busy else 'idle', 'statusUpdatedAt': since * 1000, 'estimated': True})
         for pid in self._cpu.keys() - claudes:
@@ -371,6 +422,7 @@ class Monitor:
             'key': f'claude:{s.get("pid") or sid}',
             'where': 'a terminal',
             'estimated': bool(s and s.get('estimated')),
+            'turn_start': s and s.get('turn_start'),
             'sid': sid,
             'name': name,
             'title': title if title != name else None,
@@ -600,7 +652,7 @@ class CodexSource:
             name = name if len(name) <= 40 else name[:39] + '…'
             (live if is_live else ended).append({
                 'agent': 'codex', 'key': 'codex:' + th['id'], 'sid': th['id'], 'name': name,
-                'title': None, 'cwd': cwd, 'pid': None, 'where': 'ChatGPT app' if in_app else 'Codex CLI', 'estimated': False,
+                'title': None, 'cwd': cwd, 'pid': None, 'where': 'ChatGPT app' if in_app else 'Codex CLI', 'estimated': False, 'turn_start': t.turn_ts,
                 'status': ('busy' if busy else 'idle') if is_live else 'ended',
                 'started': t.first_ts or (th.get('created_ms') or 0) / 1000 or None,
                 'since': t.turn_ts if busy else (t.done_ts or t.last_ts),
@@ -610,6 +662,118 @@ class CodexSource:
             if t.limits and (limits is None or t.limits_ts > limits[0]):
                 limits = (t.limits_ts, t.limits)
         return live, ended, keep, limits and limits[1]
+
+
+# ---------------------------------------------------------------- Claude Code hooks (exact status)
+
+HOOK_DIR = os.path.join(CACHE_DIR, 'claude')
+HOOK_EVENTS = ('SessionStart', 'UserPromptSubmit', 'Notification', 'Stop', 'SessionEnd')
+CLAUDE_SETTINGS = os.path.join(CLAUDE_DIR, 'settings.json')
+
+
+def _claude_ancestor(pid):
+    # Hooks run under a shell; walk up to the claude process that owns the session.
+    for _ in range(6):
+        try:
+            with open(f'/proc/{pid}/stat', 'rb') as f:
+                st = f.read()
+        except OSError:
+            return None
+        lp, rp = st.find(b'('), st.rfind(b')')
+        if st[lp + 1:rp] == b'claude':
+            return pid
+        pid = int(st[rp + 2:].split()[1])
+        if pid <= 1:
+            return None
+    return None
+
+
+def run_hook():
+    """`--hook`: Claude Code calls this on each hook event; it records the session's status and exits."""
+    try:
+        ev = json.load(sys.stdin)
+    except ValueError:
+        return
+    sid, name = ev.get('session_id'), ev.get('hook_event_name')
+    if not sid or name not in HOOK_EVENTS:
+        return
+    path = os.path.join(HOOK_DIR, f'{sid}.json')
+    if name == 'SessionEnd':
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return
+    try:
+        with open(path) as f:
+            rec = json.load(f)
+    except (OSError, ValueError):
+        rec = {}
+    now = time.time()
+    if name == 'UserPromptSubmit':
+        rec.update(status='busy', turn_start=now)
+    elif name == 'Stop':
+        rec['status'] = 'idle'
+    elif name == 'Notification':
+        if not _is_permission_prompt(ev):
+            return                           # "waiting for your input" reminders don't change the status
+        rec['status'] = 'waiting'
+    else:                                    # SessionStart
+        rec.setdefault('status', 'idle')
+    rec.update(session_id=sid, since=now, cwd=ev.get('cwd'), transcript=ev.get('transcript_path'),
+               pid=_claude_ancestor(os.getppid()))
+    os.makedirs(HOOK_DIR, exist_ok=True)
+    tmp = f'{path}.{os.getpid()}.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(rec, f)
+    os.replace(tmp, path)                    # atomic, so the tray never reads half a file
+
+
+def _is_permission_prompt(ev):
+    kind = ev.get('notification_type') or ''
+    if kind:
+        return 'permission' in kind
+    return 'permission' in (ev.get('message') or '').lower()
+
+
+def _hook_command():
+    return f'{shlex.quote(sys.executable)} {shlex.quote(os.path.realpath(__file__))} --hook'
+
+
+def _edit_hooks(add):
+    # Merge our hook into ~/.claude/settings.json without touching anything else; keeps a backup.
+    try:
+        with open(CLAUDE_SETTINGS) as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        cfg = {}
+    except ValueError:
+        print(f'{CLAUDE_SETTINGS} is not valid JSON; not changing it.')
+        return False
+    before = json.dumps(cfg, sort_keys=True)
+    hooks = cfg.setdefault('hooks', {})
+    for ev in HOOK_EVENTS:
+        groups = [g for g in hooks.get(ev, [])
+                  if not any('--hook' in h.get('command', '') and ('agent_tray' in h.get('command', '')
+                             or 'agent-tray' in h.get('command', '')) for h in g.get('hooks', []))]
+        if add:
+            groups.append({'hooks': [{'type': 'command', 'command': _hook_command(), 'timeout': 5}]})
+        if groups:
+            hooks[ev] = groups
+        else:
+            hooks.pop(ev, None)
+    if not hooks:
+        cfg.pop('hooks')
+    if json.dumps(cfg, sort_keys=True) == before:
+        return True
+    if os.path.exists(CLAUDE_SETTINGS):
+        shutil.copy2(CLAUDE_SETTINGS, f'{CLAUDE_SETTINGS}.agent-tray-backup')
+    tmp = CLAUDE_SETTINGS + '.agent-tray.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(cfg, f, indent=2)
+        f.write('\n')
+    os.replace(tmp, CLAUDE_SETTINGS)
+    return True
 
 
 # ---------------------------------------------------------------- startup (before GTK is loaded)
@@ -638,6 +802,14 @@ def _detach():
 
 
 if __name__ == '__main__':
+    if '--hook' in sys.argv:                 # called by Claude Code: must stay fast, no GTK
+        run_hook()
+        sys.exit(0)
+    if '--install-hooks' in sys.argv or '--remove-hooks' in sys.argv:
+        add = '--install-hooks' in sys.argv
+        ok = _edit_hooks(add)
+        print(('Claude Code hooks ' + ('installed' if add else 'removed')) if ok else 'Hooks unchanged.')
+        sys.exit(0 if ok else 1)
     if '--dump' in sys.argv:
         print(json.dumps(Monitor().scan(), indent=1))
         sys.exit(0)
@@ -918,6 +1090,7 @@ class Notifier:
         args = GLib.Variant('(susssasa{sv}i)', ('Agent Tray', self.ids.get(key, 0), icon, title, body,
                                                 ['default', 'Open dashboard', 'dash', 'Open dashboard'],
                                                 hints, -1))
+        print(time.strftime('%H:%M:%S'), 'popup:', title, '|', body, file=sys.stderr, flush=True)
         self.proxy.call('Notify', args, Gio.DBusCallFlags.NONE, -1, None, self._sent, key)
 
     def _sent(self, proxy, res, key):
@@ -991,7 +1164,8 @@ class Animator:
 ICON_FRAMES = icon_frames()
 
 
-STATUS = {'busy': ('#4CAF50', '●', '🟢'), 'idle': ('#E0A030', '●', '🟡'), 'ended': ('#888888', '○', '⚪')}
+STATUS = {'busy': ('#4CAF50', '●', '🟢'), 'idle': ('#E0A030', '●', '🟡'), 'waiting': ('#FBBF24', '⏳', '⏳'),
+          'ended': ('#888888', '○', '⚪')}
 CSS = b"""
 window.dash, window.dash viewport, .content { background-color: #000000; color: #F2F2F2; }
 window.dash headerbar { background-image: none; background-color: #0A0A0A; color: #F2F2F2;
@@ -1036,6 +1210,7 @@ window.dash headerbar button.titlebutton.close:hover { background-color: #F08A60
     background-color: #1C1C1C; color: #9A9A9A; }
 .pill.busy { background-color: #0E2A19; color: #4ADE80; }
 .pill.idle { background-color: #2B2210; color: #FBBF24; }
+.pill.waiting { background-color: #3A2A08; color: #FFD166; }
 .agent { border-radius: 6px; padding: 1px 7px; font-size: 8pt; font-weight: 700; }
 .agent.claude { background-color: #2A160E; color: #F0916A; }
 .agent.codex { background-color: #0B2A24; color: #34D8B0; }
@@ -1619,10 +1794,17 @@ class App:
             msg = f'🚀 {cur[pid]["name"]} launched'
         for pid, r in cur.items():
             old = prev.get(pid)
-            if old and old['status'] != 'busy' and r['status'] == 'busy':
+            if not old or r['estimated']:        # CPU estimates drive the display only, never popups
+                continue
+            was, now_st = old['status'], r['status']
+            if was not in ('busy', 'waiting') and now_st == 'busy':
                 self.anim.play(f'ignite_{r["agent"]}')
                 msg = f'⚡ {r["name"]} working'
-            if old and old['status'] == 'busy' and r['status'] != 'busy':
+            elif was == 'busy' and now_st == 'waiting':
+                self.anim.play('warn')
+                msg = f'⏳ {r["name"]} needs you'
+                self._notify_waiting(r)
+            elif was in ('busy', 'waiting') and now_st not in ('busy', 'waiting'):
                 self.anim.play('done')
                 msg = f'✓ {r["name"]} done'
                 self._notify_done(old, r)
@@ -1686,13 +1868,18 @@ class App:
         icon = os.path.join(CACHE_DIR, f'agent-tray-{"full" if full else "warn"}-4.svg')
         self.notifier.notify(f'{r["sid"]}:ctx', title, body, icon, 'warn')
 
+    def _notify_waiting(self, r):
+        self.notifier.notify(r['sid'], f'⏳ {r["name"]} needs attention',
+                             f'{agent_label(r)} is waiting for your permission · {r["cwd"].replace(HOME, "~", 1)}',
+                             os.path.join(CACHE_DIR, 'agent-tray-warn-4.svg'), 'warn')
+
     def _notify_done(self, old, r):
-        # statusUpdatedAt marks when each status began, so the busy span is the gap between them.
-        took = (r['since'] or time.time()) - (old['since'] or time.time())
+        # The turn start (hook / Codex) or the previous status change marks where the busy span began.
+        start = r.get('turn_start') or old.get('turn_start') or old['since'] or time.time()
+        took = (r['since'] or time.time()) - start
         if took < NOTIFY_MIN_S:
             return
-        waiting = r['status'] != 'idle'
-        title = f'{"⏳" if waiting else "✅"} {r["name"]} {"needs attention" if waiting else "finished"}'
+        title = f'✅ {r["name"]} finished'
         left = 1 - min(r['ctx'] / r['window'], 1.0)
         dur = f'{int(took // 60)}m {int(took % 60):02d}s' if 60 <= took < 600 else fmt_dur(took)
         body = (f'{agent_label(r)} · Took {dur} · {short_model(r["model"])} · {left:.0%} context left · '
@@ -1721,7 +1908,7 @@ class App:
                 used = min(r['ctx'] / r['window'], 1.0)
                 dur = fmt_dur(now - r['started']) if r['started'] else '?'
                 i, o, c_r, _ = r['tok']
-                icon = {'busy': '⚡', 'idle': '💤'}.get(r['status'], '•')
+                icon = {'busy': '⚡', 'idle': '💤', 'waiting': '⏳'}.get(r['status'], '•')
                 items.append((r, f'{dot}  {r["name"]}    {icon} {r["status"]} · {dur}', (
                     f'🧠  {short_model(r["model"])}' + (' · 1M context' if r['window'] == CTX_1M else ''),
                     f'{ctx_bar(1 - used)}  {1 - used:.0%} context left',

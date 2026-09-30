@@ -28,6 +28,9 @@ X-GNOME-Autostart-enabled=true"
 echo "$DESKTOP" > ~/.config/autostart/agent-tray.desktop
 echo "$DESKTOP" > ~/.local/share/applications/agent-tray.desktop
 
+# Claude Code hooks give the tray exact busy / idle / waiting status (backup: settings.json.agent-tray-backup).
+python3 "$APP" --install-hooks
+
 sleep 1
 python3 "$APP"
 echo "Agent Tray is running - look for the icon in the top bar. It will also start on login."

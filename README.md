@@ -18,7 +18,7 @@ The icon appears in the top bar. Click it to see your sessions. It starts automa
 
 | Agent | What it reads | Running detection |
 |---|---|---|
-| **Claude Code** (CLI) | `~/.claude/sessions/` and `~/.claude/projects/` | Exact from Claude's status file when it writes one. Claude Code 2.1.285+ may not, so the app also finds running `claude` processes and **estimates** busy / idle from CPU use and running tools (shown as "status estimated") |
+| **Claude Code** (CLI) | Claude Code **hooks** (installed by `install.sh`), `~/.claude/sessions/` and `~/.claude/projects/` | **Exact** from hooks: busy when you send a message, ⏳ waiting at a permission prompt, idle when Claude finishes. Without hooks it uses Claude's status file, or as a last resort **estimates** busy / idle from CPU (shown as "status estimated"; estimates never trigger popups) |
 | **ChatGPT desktop app** (coding threads) | `~/.codex/state_*.sqlite` (read-only) and `~/.codex/sessions/` | **Busy** while a turn is running; **open** if the app is running and the thread was used in the last 30 min |
 | **Codex CLI** | Same `~/.codex/` folder | Busy while a turn is running; **open exactly** while Codex keeps the thread's file open (the CLI's `codex app-server` background service does this), or while an interactive `codex` runs in that folder |
 
@@ -179,9 +179,12 @@ bash install.sh
 `install.sh` will:
 1. Install the tray-icon library with `apt` (asks for your sudo password)
 2. Stop any running copy, and remove an old `claude-tray` install if there is one
-3. Add an `agent-tray` command in `~/.local/bin`
-4. Add an app-menu entry (**Agent Tray**) and start the app automatically at login
-5. Start it now
+3. Add Claude Code **hooks** to `~/.claude/settings.json` for exact session status (your other settings are kept, and a backup is saved as `settings.json.agent-tray-backup`)
+4. Add an `agent-tray` command in `~/.local/bin`
+5. Add an app-menu entry (**Agent Tray**) and start the app automatically at login
+6. Start it now
+
+> Hooks apply to Claude sessions **started or resumed after** installing. Restart open sessions (`/exit`, then `claude --resume`) to get exact status there.
 
 > Autostart points at the folder you ran `install.sh` from. If you move the folder, run `bash install.sh` again.
 
@@ -211,6 +214,8 @@ Closing the terminal you started it from doesn't stop the app, and starting it t
 agent-tray                # start in the background (default)
 agent-tray --foreground   # stay attached to the terminal and print logs
 agent-tray --dump         # print the current session data (both agents) as JSON and exit
+agent-tray --install-hooks   # add the Claude Code status hooks to ~/.claude/settings.json
+agent-tray --remove-hooks    # remove them again (other settings are kept)
 ```
 
 Background logs go to `~/.cache/agent-tray/agent-tray.log`.
@@ -237,6 +242,7 @@ Edit these constants in `agent_tray.py` (search for the name), then restart the 
 | `CTX_REARM` | `0.70` | Warnings reset once context used drops below this |
 | `WARN_ACTIVE_S` | `3600` | Context warnings only for sessions with a message in the last this-many seconds |
 | `LIMIT_WARN` | `0.80` | ChatGPT plan window usage (fraction) that triggers a popup |
+| `CLAUDE_STALE_S` | `180` | A hook-"busy" Claude session quiet this long is shown idle (the turn was interrupted with Esc) |
 | `CLAUDE_BUSY_CPU` | `0.015` | For Claude sessions without a status file: CPU share above which the session counts as busy |
 | `CODEX_ACTIVE_S` | `1800` | A ChatGPT / Codex thread counts as open if used this recently while its app runs |
 | `CODEX_STALE_S` | `600` | An unfinished ChatGPT / Codex turn with no activity for this long stops counting as busy |
@@ -261,6 +267,14 @@ Edit these constants in `agent_tray.py` (search for the name), then restart the 
 - `~/.claude/sessions/<pid>.json`: one file per open session, with name, folder, start time, and busy/idle status with a timestamp. The app checks each PID is still alive to spot stale files.
 - `~/.claude/projects/<project>/<session-id>.jsonl`: each session's history, with the model and token usage of every response. Subagent histories are in `<session-id>/subagents/`.
 
+**Agent Tray's Claude hooks** (`agent-tray --hook`, about 40 ms per event) write `~/.cache/agent-tray/claude/<session-id>.json`:
+- `UserPromptSubmit` → busy (and remembers when the turn started)
+- `Notification` with `permission_prompt` → ⏳ waiting ("needs attention" popup)
+- `Stop` → idle ("finished" popup, exactly once per turn)
+- `SessionEnd` → the file is removed
+
+`Stop` doesn't fire when you interrupt a turn with Esc, so a "busy" session whose process stays quiet for 3 minutes is shown idle (without a popup).
+
 **ChatGPT / Codex** writes:
 - `~/.codex/state_*.sqlite`: the thread list (title, folder, model, last update). The app opens it read-only.
 - `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`: each thread's events. Turn start and finish give busy/idle; token events give usage, context window and plan limits.
@@ -272,6 +286,7 @@ Icon frames are small SVGs generated once into `~/.cache/agent-tray/`.
 ## Uninstall
 
 ```bash
+agent-tray --remove-hooks
 pkill -f "^(/usr/bin/)?python3 .*agent[-_]tray"
 rm ~/.local/bin/agent-tray ~/.config/autostart/agent-tray.desktop ~/.local/share/applications/agent-tray.desktop
 rm -rf ~/.cache/agent-tray
@@ -283,7 +298,8 @@ rm -rf ~/.cache/agent-tray
 - **`Namespace AyatanaAppIndicator3 not available`:** run `sudo apt install gir1.2-ayatanaappindicator3-0.1`.
 - **No popups:** check that **Do Not Disturb** is off, and that the task ran longer than `NOTIFY_MIN_S` seconds.
 - **No chime:** check that `SOUND = True`, that system sounds are on (Settings, then Sound, then Alert sound), and that Do Not Disturb is off.
-- **A Claude session says "status estimated":** that Claude Code version didn't write a status file, so busy / idle is estimated from CPU use and running tools. It switches to idle after about 6 quiet seconds.
+- **A Claude session says "status estimated":** it isn't using the hooks yet (it was started before they were installed, or they were removed). Restart it (`/exit`, then `claude --resume`), or run `agent-tray --install-hooks`. Estimated sessions never trigger popups.
+- **A popup you didn't expect:** every popup is logged with its time in `~/.cache/agent-tray/agent-tray.log`.
 - **ChatGPT threads don't show:** check that `~/.codex/` exists and has a `state_*.sqlite` file, and run `agent-tray --dump` to see what the app reads.
 - **"Already running" but no icon, or after an update:** run `bash install.sh`, or `pkill -f "^(/usr/bin/)?python3 .*agent[-_]tray"; agent-tray`.
 - **Open session does nothing:** check that `gnome-terminal` is installed (`which gnome-terminal`), then look in `~/.cache/agent-tray/agent-tray.log` for the error.
