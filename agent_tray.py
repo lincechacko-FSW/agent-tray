@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""claude-tray: top-bar indicator listing Claude Code sessions with status, models, tokens and timing."""
+"""agent-tray: top-bar indicator for AI coding agents (Claude Code, ChatGPT / Codex): sessions, models, tokens, time."""
 import fcntl
 import glob
 import json
@@ -9,6 +9,7 @@ import re
 import shlex
 import shutil
 import signal
+import sqlite3
 import sys
 import threading
 import time
@@ -18,7 +19,8 @@ HOME = os.path.expanduser('~')
 CLAUDE_DIR = os.path.join(HOME, '.claude')
 SESS_DIR = os.path.join(CLAUDE_DIR, 'sessions')
 PROJ_DIR = os.path.join(CLAUDE_DIR, 'projects')
-CACHE_DIR = os.path.join(os.environ.get('XDG_CACHE_HOME', os.path.join(HOME, '.cache')), 'claude-tray')
+CODEX_DIR = os.path.join(HOME, '.codex')
+CACHE_DIR = os.path.join(os.environ.get('XDG_CACHE_HOME', os.path.join(HOME, '.cache')), 'agent-tray')
 
 POLL_S = 3            # fast tick: live sessions + their transcripts
 SLOW_S = 30           # slow tick: rescan all projects for ended / today's files
@@ -26,6 +28,9 @@ UI_TICK_S = 30        # re-render elapsed times even when data is unchanged
 IDLE_GAP_S = 300      # gaps between messages longer than this aren't "active" time
 ENDED_SHOWN = 10
 CTX_STD, CTX_1M = 200_000, 1_000_000
+CODEX_ACTIVE_S = 1800  # a ChatGPT / Codex thread counts as open if used this recently while its app runs
+CODEX_STALE_S = 600    # an unfinished Codex turn with no writes for this long is no longer "busy"
+CODEX_PROC_S = 10      # how often to rescan /proc for the ChatGPT app / codex CLI
 
 
 def _ts(s):
@@ -159,6 +164,7 @@ class Monitor:
         self.today = []          # transcript paths touched today
         self.last_slow = 0
         self._last = None
+        self.codex = CodexSource(self)
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
@@ -179,10 +185,10 @@ class Monitor:
             self.wake.wait(POLL_S)
             self.wake.clear()
 
-    def _get(self, path):
+    def _get(self, path, cls=Transcript):
         t = self.cache.get(path)
         if t is None:
-            t = self.cache[path] = Transcript(path)
+            t = self.cache[path] = cls(path)
         t.update()
         return t
 
@@ -273,6 +279,9 @@ class Monitor:
         s = s or {}
         name = s.get('name') or title or sid[:8]
         return {
+            'agent': 'claude',
+            'key': f'claude:{s.get("pid") or sid}',
+            'where': 'a terminal',
             'sid': sid,
             'name': name,
             'title': title if title != name else None,
@@ -321,6 +330,11 @@ class Monitor:
             if len(ended) == ENDED_SHOWN:
                 break
 
+        c_live, c_ended, c_keep, limits = self.codex.scan(now)
+        rows += c_live
+        keep |= c_keep
+        ended = sorted(ended + c_ended, key=lambda r: r['last'] or 0, reverse=True)[:ENDED_SHOWN]
+
         if slow:
             for p in self.today:
                 self._get(p)
@@ -335,7 +349,164 @@ class Monitor:
             if b:
                 io += b[0]
                 cr += b[1]
-        return {'live': rows, 'ended': ended, 'today': [io, cr]}
+        return {'live': rows, 'ended': ended, 'today': [io, cr], 'limits': limits}
+
+
+class CodexTranscript(Transcript):
+    """ChatGPT desktop / Codex CLI rollout: token totals, context, turn state and plan limits, read incrementally."""
+    __slots__ = ('originator', 'turn_open', 'turn_ts', 'done_ts', 'limits', 'limits_ts', '_prev')
+
+    def __init__(self, path):
+        super().__init__(path)
+        self.originator = self.turn_ts = self.done_ts = self.limits = self.limits_ts = self._prev = None
+        self.turn_open = False
+
+    def _feed(self, line):
+        if not (b'"token_count"' in line or b'"task_' in line or b'"turn_' in line or b'"session_meta"' in line):
+            return
+        try:
+            d = json.loads(line)
+        except ValueError:
+            return
+        t, p = d.get('type'), d.get('payload') or {}
+        ts = _ts(d.get('timestamp'))
+        if ts:
+            if self.last_ts and 0 < ts - self.last_ts < IDLE_GAP_S:
+                self.active += ts - self.last_ts
+            if self.first_ts is None:
+                self.first_ts = ts
+            self.last_ts = max(ts, self.last_ts or 0)
+        if t == 'session_meta':
+            self.cwd, self.originator = p.get('cwd'), p.get('originator')
+        elif t == 'turn_context':
+            self.cwd = p.get('cwd') or self.cwd
+            if p.get('model'):
+                self.model = p['model']
+                self.models[self.model] = None
+        elif t == 'event_msg':
+            kind = p.get('type')
+            if kind == 'task_started':
+                self.turn_open, self.turn_ts = True, ts
+                self.window = p.get('model_context_window') or self.window
+            elif kind in ('task_complete', 'turn_aborted'):
+                self.turn_open, self.done_ts = False, ts
+            elif kind == 'token_count':
+                self._tokens(p, ts)
+
+    def _tokens(self, p, ts):
+        info = p.get('info') or {}
+        self.window = info.get('model_context_window') or self.window
+        tot, last = info.get('total_token_usage'), info.get('last_token_usage')
+        if tot:
+            cached = tot.get('cached_input_tokens') or 0
+            u4 = [max((tot.get('input_tokens') or 0) - cached, 0), tot.get('output_tokens') or 0,
+                  cached, tot.get('cache_write_input_tokens') or 0]
+            # Totals are cumulative, so today's share is the growth since the previous event.
+            prev, self._prev, self.tok = self._prev or [0, 0, 0, 0], u4, u4
+            if ts:
+                b = self.day.setdefault(time.localtime(ts)[:3], [0, 0])
+                b[0] += (u4[0] - prev[0]) + (u4[1] - prev[1]) + (u4[3] - prev[3])
+                b[1] += u4[2] - prev[2]
+        if last:
+            self.ctx = last.get('total_tokens') or 0
+        if p.get('rate_limits') and ts:
+            self.limits, self.limits_ts = p['rate_limits'], ts
+
+
+class CodexSource:
+    """Threads from ~/.codex (ChatGPT desktop app and Codex CLI): list from the state DB, details from rollouts."""
+
+    def __init__(self, mon):
+        self.mon = mon
+        self.threads = []
+        self._db_sig = None
+        self._procs = (0.0, False, frozenset())    # (checked at, ChatGPT app running, codex CLI cwds)
+
+    @staticmethod
+    def _db_path():
+        dbs = glob.glob(os.path.join(CODEX_DIR, 'state_*.sqlite'))
+        return max(dbs, key=lambda p: int(re.sub(r'\D', '', os.path.basename(p)) or 0)) if dbs else None
+
+    def _load_threads(self):
+        db = self._db_path()
+        if not db:
+            self.threads = []
+            return
+        sig = tuple(os.stat(p).st_mtime_ns if os.path.exists(p) else 0 for p in (db, db + '-wal'))
+        if sig == self._db_sig:          # reread only when the DB changed
+            return
+        try:
+            con = sqlite3.connect(f'file:{db}?mode=ro', uri=True, timeout=1)
+            try:
+                con.row_factory = sqlite3.Row
+                rows = con.execute(
+                    'SELECT id, rollout_path, cwd, title, name, model, originator, '
+                    'COALESCE(updated_at_ms, updated_at * 1000) AS updated_ms, '
+                    'COALESCE(created_at_ms, created_at * 1000) AS created_ms '
+                    'FROM threads WHERE archived = 0 ORDER BY updated_ms DESC LIMIT ?', (ENDED_SHOWN * 2,)).fetchall()
+            finally:
+                con.close()
+        except sqlite3.Error as e:
+            print('codex db unreadable:', e, file=sys.stderr)
+            return
+        self.threads, self._db_sig = [dict(r) for r in rows], sig
+
+    def _running(self, now):
+        # /proc scan is cached; it only decides whether recent threads still count as open.
+        if now - self._procs[0] < CODEX_PROC_S:
+            return self._procs[1], self._procs[2]
+        app, cwds = False, set()
+        for pid in os.listdir('/proc'):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f'/proc/{pid}/comm') as f:
+                    comm = f.read().strip()
+            except OSError:
+                continue
+            if comm == 'ChatGPT':
+                app = True
+            elif comm == 'codex':
+                try:
+                    cwds.add(os.readlink(f'/proc/{pid}/cwd'))
+                except OSError:
+                    pass
+        self._procs = (now, app, frozenset(cwds))
+        return app, self._procs[2]
+
+    def scan(self, now):
+        self._load_threads()
+        app, cli_cwds = self._running(now)
+        live, ended, keep, limits = [], [], set(), None
+        for th in self.threads:
+            p = th.get('rollout_path')
+            if not p:
+                continue
+            t = self.mon._get(p, CodexTranscript)
+            keep.add(p)
+            try:
+                mtime = os.stat(p).st_mtime
+            except OSError:
+                mtime = (th.get('updated_ms') or 0) / 1000
+            cwd = th.get('cwd') or t.cwd or ''
+            in_app = 'desktop' in (th.get('originator') or t.originator or '').lower()
+            recent = now - max(mtime, (th.get('updated_ms') or 0) / 1000) < CODEX_ACTIVE_S
+            busy = t.turn_open and now - mtime < CODEX_STALE_S
+            is_live = busy or (recent and (app if in_app else cwd in cli_cwds))
+            name = (th.get('name') or th.get('title') or os.path.basename(cwd) or th['id'][:8]).strip()
+            name = name if len(name) <= 40 else name[:39] + '…'
+            (live if is_live else ended).append({
+                'agent': 'codex', 'key': 'codex:' + th['id'], 'sid': th['id'], 'name': name,
+                'title': None, 'cwd': cwd, 'pid': None, 'where': 'ChatGPT app' if in_app else 'Codex CLI',
+                'status': ('busy' if busy else 'idle') if is_live else 'ended',
+                'started': t.first_ts or (th.get('created_ms') or 0) / 1000 or None,
+                'since': t.turn_ts if busy else (t.done_ts or t.last_ts),
+                'last': t.last_ts or mtime, 'active': t.active,
+                'model': t.model or th.get('model'), 'models': list(t.models), 'tok': list(t.tok),
+                'ctx': t.ctx, 'window': t.window, 'cost': None, 'api_ms': None})
+            if t.limits and (limits is None or t.limits_ts > limits[0]):
+                limits = (t.limits_ts, t.limits)
+        return live, ended, keep, limits and limits[1]
 
 
 # ---------------------------------------------------------------- startup (before GTK is loaded)
@@ -346,7 +517,7 @@ def _single_instance():
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        print('claude-tray is already running (look for the icon in the top bar).')
+        print('agent-tray is already running (look for the icon in the top bar).')
         sys.exit(0)
     return lock
 
@@ -357,7 +528,7 @@ def _detach():
         os._exit(0)
     os.setsid()
     null = os.open(os.devnull, os.O_RDONLY)
-    log = os.open(os.path.join(CACHE_DIR, 'claude-tray.log'), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    log = os.open(os.path.join(CACHE_DIR, 'agent-tray.log'), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     os.dup2(null, 0)
     os.dup2(log, 1)
     os.dup2(log, 2)
@@ -383,14 +554,17 @@ gi.require_version('AyatanaAppIndicator3', '0.1')
 from gi.repository import AyatanaAppIndicator3 as AI, Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango  # noqa: E402
 
 NAVY, DUSK = ('#2B4A86', '#0A1026'), ('#3B4150', '#181B22')
-SPARK, SPARK_GREY, PLANET_GREEN = '#E8835C', '#A3A8B3', ('#7CF2A8', '#1C9A52')
+SPARK, SPARK_GREY, PLANET_GREEN = '#C9B6FF', '#A3A8B3', ('#7CF2A8', '#1C9A52')
+CLAUDE_C, CODEX_C = '#E8835C', '#10A37F'   # per-agent colours used in the menu and dashboard
 RING, RING_GREY, SAT_GLOW = '#FFDCC8', '#9CA3AF', '#6FF7E0'
 AMBER, RED = ('#FCD34D', '#D97706'), ('#F87171', '#B91C1C')
-ANIM_MS = {'spawn': 85, 'done': 120, 'close': 110, 'warn': 110, 'full': 110, 'orbit': 200}
+ANIM_MS = {'spawn': 85, 'done': 120, 'close': 110, 'warn': 110, 'full': 110, 'orbit': 200, 'ignite': 80}
+SAT_COLORS = {'claude': '#FF9F6E', 'codex': '#3DDCA8'}   # busy satellite glow per agent
 NOTIFY_MIN_S = 10     # only popup for tasks that ran at least this long
 LABEL_FLASH_S = 4     # how long an event message stays next to the icon
 CTX_WARN, CTX_FULL = 0.80, 0.95   # context-used fractions that trigger a warning / "almost full" popup
 CTX_REARM = 0.70      # warnings reset once usage drops below this (after /compact or /clear)
+LIMIT_WARN = 0.80     # ChatGPT plan window (5-hour / weekly) usage that triggers a popup
 
 STARS = ((5.5, 6, 1.0), (26.5, 5, .8), (4.8, 24.5, .7), (27.5, 26.5, .9), (15.5, 3.2, .6), (21.5, 29.2, .6))
 ORBIT_RX, ORBIT_RY = 13, 4.2
@@ -422,46 +596,76 @@ def _stars(twinkle, dim, warp):
     return ''.join(out)
 
 
-def _satellite(theta):
+def _satellite(theta, glow=SAT_GLOW):
     # Glowing satellite plus a fading trail, in the orbit's own (untilted) coordinates.
     out = []
     for k, (a, r) in enumerate(((.18, 1.0), (.35, 1.3), (1.0, 1.9))):
         t = theta - (2 - k) * .32
         x, y = ORBIT_RX * math.cos(t), ORBIT_RY * math.sin(t)
         if k == 2:
-            out.append(f'<circle cx="{x:.2f}" cy="{y:.2f}" r="3.4" fill="{SAT_GLOW}" opacity=".35"/>')
-        out.append(f'<circle cx="{x:.2f}" cy="{y:.2f}" r="{r}" fill="{SAT_GLOW if k < 2 else "#fff"}" '
+            out.append(f'<circle cx="{x:.2f}" cy="{y:.2f}" r="3.6" fill="{glow}" opacity=".45"/>')
+        out.append(f'<circle cx="{x:.2f}" cy="{y:.2f}" r="{r}" fill="{glow if k < 2 else "#fff"}" '
                    f'opacity="{a:.2f}"/>')
     return ''.join(out)
 
 
+def _star4(x, y, r, fill):
+    k = .2 * r
+    return (f'<path d="M{x} {y - r} C{x + k} {y - k} {x + k} {y - k} {x + r} {y} '
+            f'C{x + k} {y + k} {x + k} {y + k} {x} {y + r} C{x - k} {y + k} {x - k} {y + k} {x - r} {y} '
+            f'C{x - k} {y - k} {x - k} {y - k} {x} {y - r} Z" fill="{fill}"/>')
+
+
 def _spark(color):
-    # Claude-style starburst: ten rounded rays of alternating length around a solid core.
-    rays = ''.join(f'<line x1="0" y1="-2" x2="0" y2="{-ln}" transform="rotate({i * 36})"/>'
-                   for i, ln in enumerate((10.2, 8.4) * 5))
-    return (f'<g stroke="{color}" stroke-width="2.7" stroke-linecap="round">{rays}'
-            f'<circle r="2.4" fill="{color}" stroke="none"/></g>')
+    # Generic "AI" mark: one large four-point star with two small white companions.
+    return _star4(-1.6, 1.4, 9.2, color) + _star4(6.4, -6.2, 3.6, '#fff') + _star4(7.2, 5.6, 2.2, '#fff')
 
 
-def space_svg(bg=NAVY, body=SPARK, ring=RING, scale=1.0, rot=0.0, dy=0.0, fade=1.0, sat=None, check=False,
-              rocket=None, flame=1.0, warp=0.0, burst=None, twinkle=None, dim=1.0):
-    """Starry badge with the spark in a faint orbit; extras: satellite, rocket, green check planet, starburst."""
+def _claude_logo(color=CLAUDE_C, k=1.0):
+    rays = ''.join(f'<line x1="0" y1="{-1.6 * k:.2f}" x2="0" y2="{-ln * k:.2f}" transform="rotate({i * 36})"/>'
+                   for i, ln in enumerate((7, 5.8) * 5))
+    return (f'<g stroke="{color}" stroke-width="{2 * k:.2f}" stroke-linecap="round">{rays}'
+            f'<circle r="{1.8 * k:.2f}" fill="{color}" stroke="none"/></g>')
+
+
+def _codex_logo(color=CODEX_C, k=1.0):
+    pts = ' '.join(f'{6.4 * k * math.cos(math.radians(a)):.2f},{6.4 * k * math.sin(math.radians(a)):.2f}'
+                   for a in range(30, 390, 60))
+    return (f'<polygon points="{pts}" fill="none" stroke="{color}" stroke-width="{2 * k:.2f}" stroke-linejoin="round"/>'
+            f'<circle r="{2.4 * k:.2f}" fill="{color}"/>')
+
+
+def agent_logo_svg(agent):
+    """20px agent mark: orange spark for Claude Code, teal hexagon for ChatGPT / Codex."""
+    body = _claude_logo() if agent == 'claude' else _codex_logo()
+    return f'<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="-10 -10 20 20">{body}</svg>'
+
+
+def space_svg(bg=NAVY, body=SPARK, ring=RING, scale=1.0, rot=0.0, dy=0.0, fade=1.0, sats=(), check=False,
+              rocket=None, flame=1.0, warp=0.0, burst=None, twinkle=None, dim=1.0, shock=None):
+    """Starry badge with the AI mark in a faint orbit; extras: satellites [(angle, glow)], rocket, check planet,
+    starburst, and shock=(radius, colour, opacity) for the ignition ring."""
     s = ['<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32"><defs>',
          _grad('bg', bg, 0.4, 1), _grad('p', PLANET_GREEN), '</defs>',
          '<rect x="0" y="0" width="32" height="32" rx="8" fill="url(#bg)"/>', _stars(twinkle, dim, warp)]
     if body:
         orbit = '<g transform="rotate(-20)">'
-        behind = sat is not None and math.sin(sat) < 0
+        back = ''.join(_satellite(a, g) for a, g in sats if math.sin(a) < 0)
+        front = ''.join(_satellite(a, g) for a, g in sats if math.sin(a) >= 0)
         s.append(f'<g opacity="{fade:.2f}" transform="translate(16 {16 + dy:.2f}) scale({scale:.3f})">'
                  f'{orbit}<ellipse rx="{ORBIT_RX}" ry="{ORBIT_RY}" fill="none" stroke="{ring}" stroke-width="1.3" '
-                 f'opacity=".4"/>{_satellite(sat) if behind else ""}</g>')
+                 f'opacity=".4"/>{back}</g>')
         if check:
             s.append('<circle r="7.6" fill="url(#p)"/><circle cx="-2.4" cy="-2.6" r="2.3" fill="#fff" opacity=".28"/>'
                      '<path d="M-3.8 0.2 L-1.1 3 L4 -2.6" fill="none" stroke="#fff" stroke-width="2.4" '
                      'stroke-linecap="round" stroke-linejoin="round"/>')
         else:
             s.append(f'<g transform="rotate({rot:.1f})">{_spark(body)}</g>')
-        s.append(f'{orbit}{_satellite(sat) if sat is not None and not behind else ""}</g></g>')
+        s.append(f'{orbit}{front}</g></g>')
+    if shock:
+        r, color, a = shock
+        s.append(f'<circle cx="16" cy="16" r="{r:.1f}" fill="none" stroke="{color}" stroke-width="2.2" '
+                 f'opacity="{a:.2f}"/><circle cx="16" cy="16" r="{r * .6:.1f}" fill="{color}" opacity="{a * .25:.2f}"/>')
     if rocket is not None:
         s.append(f'<g transform="translate(16 {rocket:.1f}) scale(1.3)">'
                  f'<path d="M-1.7 5 Q0 {5 + 6 * flame:.1f} 1.7 5 Z" fill="#FFC04D"/>'
@@ -492,15 +696,23 @@ def alert_svg(grad, pop=1.0, scale=1.0, flash=0.0):
     return ''.join(s)
 
 
-def gauge_svg(status, used):
-    """16px context gauge for menu items: ring fills with context used, coloured by status."""
-    color = {'busy': '#4ADE80', 'idle': '#FBBF24'}.get(status, '#9CA3AF')
-    c = 2 * math.pi * 6
+def gauge_svg(agent, used):
+    """16px context gauge for menu items: agent-coloured ring fills with context used, agent mark inside."""
+    color = CLAUDE_C if agent == 'claude' else CODEX_C
+    mark = _claude_logo(color, .42) if agent == 'claude' else _codex_logo(color, .42)
+    c = 2 * math.pi * 6.6
     return ('<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">'
-            '<circle cx="8" cy="8" r="6" fill="none" stroke="#9CA3AF" stroke-opacity=".35" stroke-width="2.4"/>'
-            f'<circle cx="8" cy="8" r="6" fill="none" stroke="{color}" stroke-width="2.4" stroke-linecap="round" '
+            '<circle cx="8" cy="8" r="6.6" fill="none" stroke="#9CA3AF" stroke-opacity=".3" stroke-width="2"/>'
+            f'<circle cx="8" cy="8" r="6.6" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" '
             f'stroke-dasharray="{c * used:.2f} {c:.2f}" transform="rotate(-90 8 8)"/>'
-            f'<circle cx="8" cy="8" r="2.3" fill="{color}"/></svg>')
+            f'<g transform="translate(8 8)">{mark}</g></svg>')
+
+
+def _orbiters(kind, theta):
+    # 'both' puts the two agents' satellites on opposite sides of the orbit.
+    if kind == 'both':
+        return ((theta, SAT_COLORS['claude']), (theta + math.pi, SAT_COLORS['codex']))
+    return ((theta, SAT_COLORS[kind]),)
 
 
 def icon_frames():
@@ -509,9 +721,14 @@ def icon_frames():
     return {
         'none': [space_svg(DUSK, SPARK_GREY, RING_GREY)],
         'idle': [space_svg()],
-        'busy': [space_svg(sat=.6)],
-        # busy: a satellite orbits the spark while the stars twinkle
-        'orbit': [space_svg(sat=.6 + 2 * math.pi * i / 12, twinkle=i // 2) for i in range(12)],
+        # busy: one satellite per busy agent orbits the mark (orange Claude, teal ChatGPT) while stars twinkle
+        **{f'busy_{k}': [space_svg(sats=_orbiters(k, .6))] for k in ('claude', 'codex', 'both')},
+        **{f'orbit_{k}': [space_svg(sats=_orbiters(k, .6 + 2 * math.pi * i / 12), twinkle=i // 2) for i in range(12)]
+           for k in ('claude', 'codex', 'both')},
+        # a session starts working: the mark flares and a shock ring in the agent's colour expands
+        **{f'ignite_{k}': [space_svg(scale=sc, shock=(r, SAT_COLORS[k], a)) for sc, r, a in
+                           ((1.0, 5, .9), (1.12, 8, .85), (1.2, 11, .7), (1.12, 13.5, .5), (1.05, 15, .3), (1, 16, .1))]
+           for k in ('claude', 'codex')},
         # new session: rocket launches through streaking stars, then the spark spins in
         'spawn': [space_svg(body=None, rocket=y, flame=f, warp=w) for y, f, w in
                   ((33, 1, .3), (26, .75, .6), (19, 1, .9), (12, .75, 1), (5, 1, 1), (-2, .75, .8), (-9, 1, .5))]
@@ -556,8 +773,8 @@ class Notifier:
         if not self.proxy:
             return
         hints = {'suppress-sound': GLib.Variant('b', True),
-                 'desktop-entry': GLib.Variant('s', 'claude-tray')}
-        args = GLib.Variant('(susssasa{sv}i)', ('Claude Tray', self.ids.get(key, 0), icon, title, body,
+                 'desktop-entry': GLib.Variant('s', 'agent-tray')}
+        args = GLib.Variant('(susssasa{sv}i)', ('Agent Tray', self.ids.get(key, 0), icon, title, body,
                                                 ['default', 'Open dashboard', 'dash', 'Open dashboard'],
                                                 hints, -1))
         self.proxy.call('Notify', args, Gio.DBusCallFlags.NONE, -1, None, self._sent, key)
@@ -574,20 +791,20 @@ class Notifier:
 
 
 class Animator:
-    """Plays queued icon frame sequences, then returns to the resting icon (or a slow busy breathe)."""
+    """Plays queued icon frame sequences, then returns to the resting icon (or the busy orbit loop)."""
 
     def __init__(self, ind):
         self.ind = ind
         self.queue = []
         self.timer = None
         self.frames, self.i, self.loop = [], 0, False
-        self.rest, self.breathe = 'none', False
+        self.rest, self.breathe = 'none', None     # breathe: looping animation name while busy
         self._shown = None
 
     def _show(self, name):
         if name != self._shown:
             self._shown = name
-            self.ind.set_icon_full(f'claude-tray-{name}', 'Claude sessions')
+            self.ind.set_icon_full(f'agent-tray-{name}', 'Agent sessions')
 
     def set_rest(self, rest, breathe):
         changed = (rest, breathe) != (self.rest, self.breathe)
@@ -608,14 +825,14 @@ class Animator:
         if self.queue:
             anim, self.loop = self.queue.pop(0), False
         elif self.breathe:
-            anim, self.loop = 'orbit', True
+            anim, self.loop = self.breathe, True
         else:
             self._show(f'{self.rest}-0')
             return
         self.frames = [f'{anim}-{i}' for i in range(len(ICON_FRAMES[anim]))]
         self.i = 0
         self._step()
-        self.timer = GLib.timeout_add(ANIM_MS[anim], self._step)
+        self.timer = GLib.timeout_add(ANIM_MS[anim.split('_', 1)[0]], self._step)
 
     def _step(self):
         if self.i >= len(self.frames):
@@ -655,8 +872,22 @@ window.dash headerbar button.titlebutton.close:hover { background-color: #F08A60
     font-size: 8.5pt; font-weight: 700; }
 .card { background-color: #0F0F0F; border: 1px solid #222222; border-left: 4px solid #3A3A3A;
     border-radius: 14px; padding: 12px 14px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.6); }
-.card.busy { border-left-color: #4ADE80; }
-.card.idle { border-left-color: #FBBF24; }
+.card.claude { border-left-color: #E8835C; background-color: #140E0B; }
+.card.codex { border-left-color: #10A37F; background-color: #09130F; }
+.card.ended { border-left-color: #3A3A3A; }
+.card.ended.claude { border-left-color: #7A4633; }
+.card.ended.codex { border-left-color: #0B5E4A; }
+.filter { background-color: #0F0F0F; border: 1px solid #222222; border-radius: 999px; padding: 3px; }
+.filter button, .filter radiobutton { background-image: none; background-color: transparent; border: none;
+    box-shadow: none; border-radius: 999px; padding: 5px 14px; color: #A3A3A3; font-weight: 700; }
+.filter button:hover { background-color: #1A1A1A; color: #FFFFFF; }
+.filter button:checked { background-color: #F2F2F2; color: #000000; }
+.filter button.claude:checked { background-color: #E8835C; color: #FFFFFF; }
+.filter button.codex:checked { background-color: #10A37F; color: #FFFFFF; }
+.group { font-size: 11pt; font-weight: 800; }
+.group.claude { color: #F0916A; }
+.group.codex { color: #2FD9A0; }
+.group-note { font-size: 9pt; color: #8FD9C2; }
 .name { font-size: 12pt; font-weight: 700; color: #F2F2F2; }
 .muted { color: #A3A3A3; }
 .faint { color: #6E6E6E; font-size: 9pt; }
@@ -664,6 +895,10 @@ window.dash headerbar button.titlebutton.close:hover { background-color: #F08A60
     background-color: #1C1C1C; color: #9A9A9A; }
 .pill.busy { background-color: #0E2A19; color: #4ADE80; }
 .pill.idle { background-color: #2B2210; color: #FBBF24; }
+.agent { border-radius: 6px; padding: 1px 7px; font-size: 8pt; font-weight: 700; }
+.agent.claude { background-color: #2A160E; color: #F0916A; }
+.agent.codex { background-color: #0B2A24; color: #34D8B0; }
+.limits { font-size: 9pt; color: rgba(255, 255, 255, 0.92); }
 .chip { background-color: #1A1A1A; color: #D4D4D4; border: 1px solid #2A2A2A; border-radius: 6px;
     padding: 1px 8px; font-size: 8.5pt; font-weight: 600; font-family: monospace; }
 .pct { font-size: 13pt; font-weight: 800; color: #F2F2F2; }
@@ -678,6 +913,8 @@ window.dash headerbar button.titlebutton.close:hover { background-color: #F08A60
 button.primary { background-image: none; background-color: #E0784F; color: #FFFFFF; border: none;
     border-radius: 999px; padding: 4px 16px; font-weight: 700; box-shadow: 0 2px 10px rgba(224, 120, 79, 0.35); }
 button.primary:hover { background-color: #F08A60; }
+.card.codex button.primary { background-color: #10A37F; box-shadow: 0 2px 10px rgba(16, 163, 127, 0.35); }
+.card.codex button.primary:hover { background-color: #19B98F; }
 button.primary label { color: #FFFFFF; }
 button.icon { background-image: none; background-color: transparent; border: none; box-shadow: none;
     border-radius: 999px; padding: 4px 6px; color: #A3A3A3; }
@@ -712,12 +949,25 @@ def esc(s):
 
 
 CLAUDE_BIN = shutil.which('claude') or os.path.join(HOME, '.local', 'bin', 'claude')
+CODEX_BIN = shutil.which('codex') or os.path.join(HOME, '.local', 'bin', 'codex')
+CHATGPT_BIN = shutil.which('chatgpt')
+AGENTS = {'claude': ('Claude Code', '🟠'), 'codex': ('ChatGPT', '🟢')}
 TERMINAL = shutil.which('gnome-terminal') or 'x-terminal-emulator'
 
 
 def resume_cmd(r, fork=False):
-    return (f'{shlex.quote(CLAUDE_BIN)} --resume {shlex.quote(r["sid"])}'
-            + (' --fork-session' if fork else ''))
+    sid = shlex.quote(r['sid'])
+    if r['agent'] == 'codex':
+        return f'{shlex.quote(CODEX_BIN)} {"fork" if fork else "resume"} {sid}'
+    return f'{shlex.quote(CLAUDE_BIN)} --resume {sid}' + (' --fork-session' if fork else '')
+
+
+def open_chatgpt(*_):
+    if CHATGPT_BIN:
+        try:
+            Gio.Subprocess.new([CHATGPT_BIN], Gio.SubprocessFlags.NONE)
+        except GLib.Error as e:
+            print('could not open ChatGPT:', e.message, file=sys.stderr)
 
 
 def open_folder(r):
@@ -729,13 +979,34 @@ def copy_resume(r):
     Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(f'cd {shlex.quote(r["cwd"])} && {resume_cmd(r)}', -1)
 
 
+def _window_name(minutes):
+    return {300: '5-hour', 10080: 'weekly'}.get(minutes, f'{minutes // 60}-hour' if minutes else '?')
+
+
+def limits_text(limits, short=False):
+    # "5-hour 3% used (resets 16:29) · weekly 0% used (resets Oct 06)"
+    parts = []
+    for w in ((limits or {}).get('primary'), (limits or {}).get('secondary')):
+        if not w:
+            continue
+        name = _window_name(w.get('window_minutes'))
+        used = f'{w.get("used_percent", 0):.0f}%'
+        if short:
+            parts.append(f'{name.replace("-hour", "h")} {used}')
+            continue
+        at = w.get('resets_at')
+        fmt = '%H:%M' if at and at - time.time() < 86400 else '%b %d'
+        parts.append(f'{name} {used} used' + (f' (resets {time.strftime(fmt, time.localtime(at))})' if at else ''))
+    return ' · '.join(parts)
+
+
 def ctx_bar(left, n=10):
     k = round(left * n)
     return '▰' * k + '▱' * (n - k)
 
 
 def launch_session(r, fork=False):
-    # New terminal in the session's folder running claude --resume; the shell stays after claude exits.
+    # New terminal in the session's folder running the agent's resume/fork; the shell stays afterwards.
     cwd = r['cwd'] if os.path.isdir(r['cwd']) else HOME
     argv = [TERMINAL, f'--working-directory={cwd}', '--', 'bash', '-lc', f'{resume_cmd(r, fork)}; exec bash']
     try:
@@ -803,13 +1074,17 @@ class Card(Gtk.Box):
         self.folder = _lbl('faint', ellipsize=E.MIDDLE)
         self.pill = _lbl('pill', valign=Gtk.Align.START)
         names = _box(self.name, self.title, self.folder, vertical=True, spacing=1)
+        self.logo = Gtk.Image(valign=Gtk.Align.START, margin_top=2)
         top = Gtk.Box(spacing=10)
+        top.pack_start(self.logo, False, False, 0)
         top.pack_start(names, True, True, 0)
         top.pack_end(self.pill, False, False, 0)
 
+        self.agent = _lbl('agent')
         self.chip = _lbl('chip')
         self.also = _lbl('faint', ellipsize=E.END, no_show_all=True)
-        models = _box(self.chip, self.also, spacing=8)
+        models = _box(self.agent, self.chip, self.also, spacing=8)
+        self._agent = None
 
         self.bar = Gtk.ProgressBar(valign=Gtk.Align.CENTER, hexpand=True)
         self.pct = _lbl('pct')
@@ -828,7 +1103,9 @@ class Card(Gtk.Box):
         self.time = _lbl('muted', wrap=True)
         self.open_btn = _cls(Gtk.Button(label='Open session'), 'primary')
         self.open_btn.connect('clicked', self._resume)
-        actions = _box(self.open_btn,
+        self.gpt_btn = _icon_btn('go-jump-symbolic', 'Open the ChatGPT app', open_chatgpt)
+        self.gpt_btn.set_no_show_all(True)
+        actions = _box(self.open_btn, self.gpt_btn,
                        _icon_btn('folder-open-symbolic', 'Open project folder', self._open),
                        _icon_btn('edit-copy-symbolic', 'Copy resume command', self._copy), spacing=4)
         for w in (top, models, ctx, self.ctx_note, stats, self.time, actions):
@@ -847,11 +1124,21 @@ class Card(Gtk.Box):
             pc.add_class(st)
             self._state = st
         live = r['status'] != 'ended'
+        if r['agent'] != self._agent:
+            for ctx in (self.agent.get_style_context(), self.get_style_context()):
+                if self._agent:
+                    ctx.remove_class(self._agent)
+                ctx.add_class(r['agent'])
+            self._agent = r['agent']
+            self.logo.set_from_pixbuf(agent_logo(r['agent']))
+            _set(self.agent, AGENTS[r['agent']][0])
+            self.gpt_btn.set_visible(r['agent'] == 'codex' and bool(CHATGPT_BIN))
         _set(self.name, esc(r['name']))
         _set(self.title, esc(r['title']))
         self.title.set_visible(bool(r['title']))
         _set(self.folder, esc(r['cwd'].replace(HOME, '~', 1))
-             + (f'  ·  PID {r["pid"]}, open in a terminal' if live else ''))
+             + ((f'  ·  PID {r["pid"]}, open in {r["where"]}' if r['pid'] else f'  ·  open in {r["where"]}')
+                if live else ''))
         _set(self.pill, f'{STATUS[st][1]} {esc(r["status"])}')
 
         cur = r['model']
@@ -905,6 +1192,39 @@ class Card(Gtk.Box):
             copy_resume(self.row)
 
 
+_LOGOS = {}
+PREFS = os.path.join(CACHE_DIR, 'prefs.json')
+
+
+def _load_pref(key, default):
+    try:
+        with open(PREFS) as f:
+            return json.load(f).get(key, default)
+    except (OSError, ValueError, AttributeError):
+        return default
+
+
+def _save_pref(key, value):
+    try:
+        with open(PREFS) as f:
+            prefs = json.load(f)
+    except (OSError, ValueError):
+        prefs = {}
+    prefs[key] = value
+    try:
+        with open(PREFS, 'w') as f:
+            json.dump(prefs, f)
+    except OSError as e:
+        print('could not save prefs:', e, file=sys.stderr)
+
+
+def agent_logo(agent, size=20):
+    key = (agent, size)
+    if key not in _LOGOS:
+        _LOGOS[key] = svg_pixbuf(agent_logo_svg(agent), size)
+    return _LOGOS[key]
+
+
 def _section(title):
     count = _lbl('count', valign=Gtk.Align.CENTER)
     return _box(_lbl('section', label=title), count, spacing=8), count
@@ -912,12 +1232,12 @@ def _section(title):
 
 class Dashboard(Gtk.Window):
     def __init__(self, on_refresh):
-        super().__init__(title='Claude sessions')
+        super().__init__(title='Agent Tray')
         _cls(self, 'dash')
         self.set_default_size(540, 760)
         self.connect('delete-event', lambda w, _e: w.hide() or True)   # closing only hides
-        self.connect('key-press-event', lambda w, e: e.keyval == Gdk.KEY_Escape and (w.hide() or True))
-        hb = Gtk.HeaderBar(title='Claude sessions', subtitle='Live · updates automatically',
+        self.connect('key-press-event', self._on_key)
+        hb = Gtk.HeaderBar(title='Agent Tray', subtitle='Claude Code · ChatGPT · live',
                            show_close_button=True)
         hb.pack_end(_icon_btn('view-refresh-symbolic', 'Refresh now', lambda *_: on_refresh()))
         hb.show_all()                    # titlebar isn't covered by the content's show_all()
@@ -930,40 +1250,107 @@ class Dashboard(Gtk.Window):
             val = _lbl('tile-val')
             tiles.pack_start(_cls(_box(val, _lbl('tile-key', label=name), vertical=True), 'tile'), True, True, 0)
             self.tiles[key] = val
-        banner = _cls(_box(_lbl('kicker', label='CLAUDE CODE'), _lbl('hero', label='Your sessions'),
+        banner = _cls(_box(_lbl('kicker', label='AGENT TRAY'), _lbl('hero', label='Your AI sessions'),
                            vertical=True, spacing=2), 'banner')
         banner.pack_start(tiles, False, False, 10)
 
+        # Segmented filter: All / Claude Code / ChatGPT; it only hides cards, nothing is re-read.
+        self.filter, self._snap = _load_pref('filter', 'all'), None
+        switch = _cls(Gtk.Box(halign=Gtk.Align.START), 'filter')
+        self.filter_btns, group = {}, None
+        for key in ('all', *AGENTS):
+            b = Gtk.RadioButton.new_from_widget(group)
+            group = group or b
+            b.set_mode(False)            # draw as a toggle button, not a radio dot
+            _cls(b, key)
+            b.set_tooltip_text(f'Show {"all sessions" if key == "all" else AGENTS[key][0] + " only"} '
+                               f'(key {1 + ("all", *AGENTS).index(key)})')
+            b.connect('toggled', self._on_filter, key)
+            switch.pack_start(b, False, False, 0)
+            self.filter_btns[key] = b
+        self.filter_btns.get(self.filter, self.filter_btns['all']).set_active(True)
+
         live_head, self.live_count = _section('Running')
-        self.live_box = _box(vertical=True, spacing=10)
-        self.empty = _lbl('empty', wrap=True, label='No running sessions. Start one by running claude in a terminal.')
+        self.live_box = _box(vertical=True, spacing=14)
+        self.groups = {}
+        for agent, (title, _dot) in AGENTS.items():
+            count = _lbl('count', valign=Gtk.Align.CENTER)
+            head = _box(Gtk.Image.new_from_pixbuf(agent_logo(agent)), _lbl('group', agent, label=title), count, spacing=8)
+            note = _lbl('group-note', wrap=True, no_show_all=True)
+            box = _box(vertical=True, spacing=10)
+            group = _box(head, note, box, vertical=True, spacing=8, no_show_all=True)
+            head.show_all()
+            box.show()
+            self.live_box.pack_start(group, False, False, 0)
+            self.groups[agent] = (group, count, note, box)
+        self.limits = self.groups['codex'][2]
+        self.empty = _lbl('empty', wrap=True, label='No running sessions. Start claude or codex in a terminal, '
+                                                    'or open a thread in the ChatGPT app.')
         ended_head, self.ended_count = _section('Recently ended')
         self.ended_box = _box(vertical=True, spacing=10, margin_top=10)
         exp = Gtk.Expander(expanded=True)
         exp.set_label_widget(ended_head)
         exp.add(self.ended_box)
-        note = _lbl('faint', wrap=True, label='Plan usage limits (5-hour / weekly) are not stored locally. '
-                                              'Run /usage inside Claude Code to see them.')
-        root = _cls(_box(banner, live_head, self.empty, self.live_box, exp, note,
+        note = _lbl('faint', wrap=True, label='Claude plan limits (5-hour / weekly) are not stored locally; '
+                                              'run /usage inside Claude Code. ChatGPT limits are shown in its section.')
+        root = _cls(_box(banner, switch, live_head, self.empty, self.live_box, exp, note,
                          vertical=True, spacing=12, margin=16), 'content')
         sw = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
         sw.add(root)
         self.add(sw)
-        self.cards = {self.live_box: {}, self.ended_box: {}}
+        self.cards = {self.ended_box: {}, **{g[3]: {} for g in self.groups.values()}}
         self._seeded = set()             # boxes filled once; later cards slide in
         sw.show_all()
 
+    def _on_key(self, _w, e):
+        if e.keyval == Gdk.KEY_Escape:
+            self.hide()
+            return True
+        keys = {Gdk.KEY_1: 'all', Gdk.KEY_2: 'claude', Gdk.KEY_3: 'codex'}
+        if e.keyval in keys:
+            self.filter_btns[keys[e.keyval]].set_active(True)
+            return True
+        return False
+
+    def _on_filter(self, btn, key):
+        if not btn.get_active() or key == self.filter:   # 'toggled' also fires on the button being released
+            return
+        self.filter = key
+        _save_pref('filter', key)
+        if self._snap:
+            self.update(self._snap, time.time())
+
+    def _shown(self, r):
+        return self.filter in ('all', r['agent'])
+
     def update(self, snap, now):
+        self._snap = snap
         live = snap['live']
         io, cr = snap['today']
         for key, v in (('running', str(len(live))), ('busy', str(sum(r['status'] == 'busy' for r in live))),
                        ('today', fmt_tok(io)), ('cache', fmt_tok(cr))):
             _set(self.tiles[key], v)
-        _set(self.live_count, str(len(live)))
-        _set(self.ended_count, str(len(snap['ended'])))
-        self.empty.set_visible(not live)
-        self._sync(self.live_box, live, now)
+        for key, b in self.filter_btns.items():
+            n = sum(key in ('all', r['agent']) for r in live)
+            label = f'All  {n}' if key == 'all' else f'{AGENTS[key][1]}  {AGENTS[key][0]}  {n}'
+            if b.get_label() != label:
+                b.set_label(label)
+        shown_live = [r for r in live if self._shown(r)]
+        _set(self.live_count, str(len(shown_live)))
+        _set(self.ended_count, str(sum(self._shown(r) for r in snap['ended'])))
+        self.empty.set_visible(not shown_live)
+        text = limits_text(snap.get('limits'))
+        _set(self.limits, f'<b>Plan usage</b> · {esc(text)}' if text else '')
+        self.limits.set_visible(bool(text))
+        for agent, (group, count, _note, box) in self.groups.items():
+            rows = [r for r in live if r['agent'] == agent]
+            _set(count, str(len(rows)))
+            group.set_visible(self.filter in ('all', agent) and (bool(rows) or (agent == 'codex' and bool(text))))
+            self._sync(box, rows, now)
         self._sync(self.ended_box, snap['ended'], now)
+        cards = self.cards[self.ended_box]
+        for r in snap['ended']:
+            cards[r['sid']].get_parent().set_visible(self._shown(r))
 
     def _sync(self, box, rows, now):
         # Reuse card widgets keyed by session id; only add/remove/reorder what changed.
@@ -994,13 +1381,14 @@ class App:
         self._menu_sig = None
         self._prev = None                # pid -> row from the previous snapshot
         self._label_msg = self._label_timer = None
-        self._ctx_level = {}             # pid -> highest context warning sent (0 none, 1 warn, 2 full)
+        self._ctx_level = {}             # key -> highest context warning sent (0 none, 1 warn, 2 full)
+        self._limit_sent = set()         # (window, resets_at) plan-limit popups already shown
         self._write_icons()
         apply_theme()
-        self.ind = AI.Indicator.new('claude-tray', 'claude-tray-none-0',
+        self.ind = AI.Indicator.new('agent-tray', 'agent-tray-none-0',
                                     AI.IndicatorCategory.APPLICATION_STATUS)
         self.ind.set_icon_theme_path(CACHE_DIR)
-        self.ind.set_title('Claude sessions')
+        self.ind.set_title('Agent sessions')
         self.ind.set_status(AI.IndicatorStatus.ACTIVE)
         self.anim = Animator(self.ind)
         self.notifier = Notifier(lambda: self.show_dashboard())
@@ -1008,7 +1396,7 @@ class App:
         self.win = Dashboard(lambda: self.monitor.poke(force=True))
         self._gauges = {}                # (status, used/20) -> menu icon pixbuf
         self._logo = svg_pixbuf(ICON_FRAMES['idle'][0], 16)
-        self._build_menu({'live': [], 'ended': [], 'today': [0, 0]}, time.time())
+        self._build_menu({'live': [], 'ended': [], 'today': [0, 0], 'limits': None}, time.time())
         try:
             os.makedirs(SESS_DIR, exist_ok=True)
             self.fmon = Gio.File.new_for_path(SESS_DIR).monitor_directory(Gio.FileMonitorFlags.NONE, None)
@@ -1022,7 +1410,7 @@ class App:
     def _write_icons():
         for name, frames in ICON_FRAMES.items():
             for i, svg in enumerate(frames):
-                p = os.path.join(CACHE_DIR, f'claude-tray-{name}-{i}.svg')
+                p = os.path.join(CACHE_DIR, f'agent-tray-{name}-{i}.svg')
                 try:
                     with open(p) as f:
                         if f.read() == svg:
@@ -1041,9 +1429,11 @@ class App:
         self.snap = snap
         now = time.time()
         live = snap['live']
-        busy = sum(r['status'] == 'busy' for r in live)
+        busy = {r['agent'] for r in live if r['status'] == 'busy'}
         self._animate(live)
-        self.anim.set_rest('busy' if busy else 'idle' if live else 'none', bool(busy))
+        self._check_limits(snap.get('limits'))
+        kind = 'both' if len(busy) > 1 else next(iter(busy), None)
+        self.anim.set_rest(f'busy_{kind}' if kind else 'idle' if live else 'none', kind and f'orbit_{kind}')
         self._update_label()
         self._build_menu(snap, now)
         if self.win.get_visible():
@@ -1067,8 +1457,8 @@ class App:
         return False
 
     def _animate(self, live):
-        # Keyed by PID: a session's id can change on /clear, its process can't.
-        cur = {r['pid']: r for r in live}
+        # Claude keys on PID (its session id changes on /clear); Codex keys on the thread id.
+        cur = {r['key']: r for r in live}
         prev, self._prev = self._prev, cur
         ctx_msg = self._check_context(live, animate=prev is not None)
         if prev is None:                         # no events for what was already open at startup
@@ -1079,6 +1469,9 @@ class App:
             msg = f'🚀 {cur[pid]["name"]} launched'
         for pid, r in cur.items():
             old = prev.get(pid)
+            if old and old['status'] != 'busy' and r['status'] == 'busy':
+                self.anim.play(f'ignite_{r["agent"]}')
+                msg = f'⚡ {r["name"]} working'
             if old and old['status'] == 'busy' and r['status'] != 'busy':
                 self.anim.play('done')
                 msg = f'✓ {r["name"]} done'
@@ -1094,7 +1487,7 @@ class App:
         # Each level fires once per session; dropping below CTX_REARM (e.g. /compact) re-arms both.
         levels, msg = {}, None
         for r in live:
-            pid, used = r['pid'], min(r['ctx'] / r['window'], 1.0)
+            pid, used = r['key'], min(r['ctx'] / r['window'], 1.0)
             old = self._ctx_level.get(pid, 0)
             hit = 2 if used >= CTX_FULL else 1 if used >= CTX_WARN else 0
             new = levels[pid] = 0 if used < CTX_REARM else max(old, hit)
@@ -1106,12 +1499,29 @@ class App:
         self._ctx_level = levels
         return msg
 
+    def _check_limits(self, limits):
+        # One popup per plan window per reset period, once usage passes LIMIT_WARN.
+        for slot in ('primary', 'secondary'):
+            w = (limits or {}).get(slot)
+            if not w or (w.get('used_percent') or 0) < LIMIT_WARN * 100:
+                continue
+            key = (slot, w.get('resets_at'))
+            if key in self._limit_sent:
+                continue
+            self._limit_sent.add(key)
+            name, at = _window_name(w.get('window_minutes')), w.get('resets_at')
+            self.notifier.notify(f'codex:limit:{slot}', f'⚠️ ChatGPT {name} limit {w["used_percent"]:.0f}% used',
+                                 f'Plan: {limits.get("plan_type") or "?"}'
+                                 + (f' · resets {time.strftime("%a %H:%M", time.localtime(at))}' if at else ''),
+                                 os.path.join(CACHE_DIR, 'agent-tray-warn-4.svg'))
+
     def _notify_ctx(self, r, level, used):
         full = level == 2
         title = f'{"🔴" if full else "⚠️"} {r["name"]} context {"almost full" if full else f"{used:.0%} full"}'
         tip = 'run /compact or start a new session' if full else 'consider /compact soon'
-        body = f'{fmt_tok(r["ctx"])} of {fmt_tok(r["window"])} used · {tip} · {r["cwd"].replace(HOME, "~", 1)}'
-        icon = os.path.join(CACHE_DIR, f'claude-tray-{"full" if full else "warn"}-4.svg')
+        body = (f'{AGENTS[r["agent"]][0]} · {fmt_tok(r["ctx"])} of {fmt_tok(r["window"])} used · {tip} · '
+                f'{r["cwd"].replace(HOME, "~", 1)}')
+        icon = os.path.join(CACHE_DIR, f'agent-tray-{"full" if full else "warn"}-4.svg')
         self.notifier.notify(f'{r["sid"]}:ctx', title, body, icon)
 
     def _notify_done(self, old, r):
@@ -1123,9 +1533,9 @@ class App:
         title = f'{"⏳" if waiting else "✅"} {r["name"]} {"needs attention" if waiting else "finished"}'
         left = 1 - min(r['ctx'] / r['window'], 1.0)
         dur = f'{int(took // 60)}m {int(took % 60):02d}s' if 60 <= took < 600 else fmt_dur(took)
-        body = (f'Took {dur} · {short_model(r["model"])} · {left:.0%} context left · '
+        body = (f'{AGENTS[r["agent"]][0]} · Took {dur} · {short_model(r["model"])} · {left:.0%} context left · '
                 f'{r["cwd"].replace(HOME, "~", 1)}')
-        self.notifier.notify(r['sid'], title, body, os.path.join(CACHE_DIR, 'claude-tray-done-4.svg'))
+        self.notifier.notify(r['sid'], title, body, os.path.join(CACHE_DIR, 'agent-tray-done-4.svg'))
 
     def _gauge(self, key):
         g = self._gauges.get(key)
@@ -1137,25 +1547,35 @@ class App:
         live = snap['live']
         busy = sum(r['status'] == 'busy' for r in live)
         io, cr = snap['today']
-        header = (f'Claude Code — {len(live)} running · {busy} busy', f'Today {fmt_tok(io)} tokens · {fmt_tok(cr)} cached')
-        sessions = []
-        for r in live:
-            used = min(r['ctx'] / r['window'], 1.0)
-            dur = fmt_dur(now - r['started']) if r['started'] else '?'
-            i, o, c_r, _ = r['tok']
-            icon = {'busy': '⚡', 'idle': '💤'}.get(r['status'], '•')
-            sessions.append((r, f'{r["name"]}    {icon} {r["status"]} · {dur}', (
-                f'🧠  {short_model(r["model"])}' + (' · 1M context' if r['window'] == CTX_1M else ''),
-                f'{ctx_bar(1 - used)}  {1 - used:.0%} context left',
-                f'⬆ {fmt_tok(i)} in  ·  ⬇ {fmt_tok(o)} out  ·  {fmt_tok(c_r)} cached',
-                f'⏱  running {dur} · active {fmt_dur(r["active"])}'), (r['status'], round(used * 20))))
-        ended = [(f'{r["name"]} — {os.path.basename(r["cwd"]) or "~"}'
+        header = (f'Agent Tray — {len(live)} running · {busy} busy', f'Today {fmt_tok(io)} tokens · {fmt_tok(cr)} cached')
+        sections = []
+        for agent, (title, dot) in AGENTS.items():
+            rows = [r for r in live if r['agent'] == agent]
+            lim = limits_text(snap.get('limits'), short=True) if agent == 'codex' else ''
+            if not rows and not lim:
+                continue
+            items = []
+            for r in rows:
+                used = min(r['ctx'] / r['window'], 1.0)
+                dur = fmt_dur(now - r['started']) if r['started'] else '?'
+                i, o, c_r, _ = r['tok']
+                icon = {'busy': '⚡', 'idle': '💤'}.get(r['status'], '•')
+                items.append((r, f'{dot}  {r["name"]}    {icon} {r["status"]} · {dur}', (
+                    f'🧠  {short_model(r["model"])}' + (' · 1M context' if r['window'] == CTX_1M else ''),
+                    f'{ctx_bar(1 - used)}  {1 - used:.0%} context left',
+                    f'⬆ {fmt_tok(i)} in  ·  ⬇ {fmt_tok(o)} out  ·  {fmt_tok(c_r)} cached',
+                    f'⏱  running {dur} · active {fmt_dur(r["active"])}',
+                    f'📍  open in {r["where"]}'), (agent, round(used * 20))))
+            label = title.upper() + (f'  ·  {len(rows)} running' if rows else '') + (f'  ·  plan {lim} used' if lim else '')
+            sections.append((agent, label, items))
+        ended = [(f'{AGENTS[r["agent"]][1]}  {r["name"]} — {os.path.basename(r["cwd"]) or "~"}'
                   + (f' · {fmt_dur(now - r["last"])} ago' if r['last'] else ''), r) for r in snap['ended']]
-        return header, sessions, ended
+        return header, sections, ended
 
     def _build_menu(self, snap, now):
-        header, sessions, ended = self._menu_model(snap, now)
-        sig = (header, tuple((r['sid'], t, d, g) for r, t, d, g in sessions), tuple((t, r['sid']) for t, r in ended))
+        header, sections, ended = self._menu_model(snap, now)
+        sig = (header, tuple((a, lb, tuple((r['sid'], t, d, g) for r, t, d, g in items)) for a, lb, items in sections),
+               tuple((t, r['sid']) for t, r in ended))
         if sig == self._menu_sig:        # skip DBus menu churn when nothing changed
             return
         self._menu_sig = sig
@@ -1175,17 +1595,23 @@ class App:
 
         add(header[0], self.show_dashboard, self._logo)
         add(header[1], self.show_dashboard)
-        menu.append(Gtk.SeparatorMenuItem())
-        for r, title, details, gauge in sessions:
-            sub = Gtk.Menu()
-            for d in details:
-                add(d, self.show_dashboard, into=sub)
-            sub.append(Gtk.SeparatorMenuItem())
-            add('▶  Open copy in terminal', lambda _i, r=r: launch_session(r, fork=True), into=sub)
-            add('📁  Open folder', lambda _i, r=r: open_folder(r), into=sub)
-            add('📋  Copy resume command', lambda _i, r=r: copy_resume(r), into=sub)
-            add(title, icon=self._gauge(gauge)).set_submenu(sub)
-        if not sessions:
+        for agent, label, items in sections:
+            menu.append(Gtk.SeparatorMenuItem())
+            add(label, open_chatgpt if agent == 'codex' and CHATGPT_BIN else self.show_dashboard,
+                agent_logo(agent, 16))
+            for r, title, details, gauge in items:
+                sub = Gtk.Menu()
+                for d in details:
+                    add(d, self.show_dashboard, into=sub)
+                sub.append(Gtk.SeparatorMenuItem())
+                add('▶  Open copy in terminal', lambda _i, r=r: launch_session(r, fork=True), into=sub)
+                if agent == 'codex' and CHATGPT_BIN:
+                    add('💬  Open the ChatGPT app', open_chatgpt, into=sub)
+                add('📁  Open folder', lambda _i, r=r: open_folder(r), into=sub)
+                add('📋  Copy resume command', lambda _i, r=r: copy_resume(r), into=sub)
+                add(title, icon=self._gauge(gauge)).set_submenu(sub)
+        if not any(items for _, _, items in sections):
+            menu.append(Gtk.SeparatorMenuItem())
             add('🌌  No running sessions', self.show_dashboard)
         menu.append(Gtk.SeparatorMenuItem())
         if ended:
