@@ -11,8 +11,10 @@ import shutil
 import signal
 import sqlite3
 import sys
+import struct
 import threading
 import time
+import wave
 from datetime import datetime
 
 HOME = os.path.expanduser('~')
@@ -31,6 +33,9 @@ CTX_STD, CTX_1M = 200_000, 1_000_000
 CODEX_ACTIVE_S = 1800  # a ChatGPT / Codex thread counts as open if used this recently while its app runs
 CODEX_STALE_S = 600    # an unfinished Codex turn with no writes for this long is no longer "busy"
 CODEX_PROC_S = 10      # how often to rescan /proc for the ChatGPT app / codex CLI
+CLAUDE_BUSY_CPU = 0.015  # fallback status: a claude process above this CPU share counts as busy
+CLAUDE_SUBCMDS = {'mcp', 'config', 'update', 'doctor', 'install', 'migrate-installer', 'setup-token', 'plugin'}
+CLK_TCK = os.sysconf('SC_CLK_TCK')
 
 
 def _ts(s):
@@ -142,6 +147,25 @@ class Transcript:
             b[1] += sign * u4[2]
 
 
+def _boot_time():
+    try:
+        with open('/proc/stat') as f:
+            return next(int(l.split()[1]) for l in f if l.startswith('btime'))
+    except (OSError, StopIteration, ValueError):
+        return 0
+
+
+BOOT_TIME = _boot_time()
+
+
+def _argv(pid):
+    try:
+        with open(f'/proc/{pid}/cmdline', 'rb') as f:
+            return [a.decode(errors='replace') for a in f.read().split(b'\0') if a]
+    except OSError:
+        return []
+
+
 def _proc_start(pid):
     try:
         with open(f'/proc/{int(pid)}/stat', 'rb') as f:
@@ -165,6 +189,8 @@ class Monitor:
         self.last_slow = 0
         self._last = None
         self.codex = CodexSource(self)
+        self._ptab, self._ptime = {}, 0.0
+        self._cpu = {}           # fallback claude pid -> (sampled at, cpu ticks, busy, quiet samples, since)
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
@@ -191,6 +217,68 @@ class Monitor:
             t = self.cache[path] = cls(path)
         t.update()
         return t
+
+    def procs(self, now):
+        # One cached /proc pass per tick, shared by the Claude fallback and Codex: pid -> (comm, ppid, ticks, start).
+        if now - self._ptime < POLL_S - 0.5:
+            return self._ptab
+        tab = {}
+        for pid in os.listdir('/proc'):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f'/proc/{pid}/stat', 'rb') as f:
+                    st = f.read()
+            except OSError:
+                continue
+            lp, rp = st.find(b'('), st.rfind(b')')
+            rest = st[rp + 2:].split()
+            try:
+                tab[int(pid)] = (st[lp + 1:rp].decode(errors='replace'), int(rest[1]),
+                                 int(rest[11]) + int(rest[12]), int(rest[19]))
+            except (IndexError, ValueError):
+                continue
+        self._ptab, self._ptime = tab, now
+        return tab
+
+    def _fallback(self, known, now):
+        """Claude processes without a sessions/<pid>.json (Claude Code 2.1.285+); busy/idle is estimated."""
+        tab = self.procs(now)
+        claudes = {pid for pid, v in tab.items() if v[0] == 'claude' and pid not in known}
+        # Claude's Bash tool runs `bash -c source …/shell-snapshots/…`, a precise "tool running" signal.
+        tools = {v[1] for pid, v in tab.items()
+                 if v[1] in claudes and v[0] in ('bash', 'sh', 'zsh') and 'shell-snapshots' in ' '.join(_argv(pid))}
+        out = []
+        for pid in claudes:
+            argv = _argv(pid)
+            if not argv or '-p' in argv or '--print' in argv or (len(argv) > 1 and argv[1] in CLAUDE_SUBCMDS):
+                continue
+            _comm, _ppid, ticks, start = tab[pid]
+            prev = self._cpu.get(pid)
+            rate = (ticks - prev[1]) / max(now - prev[0], .5) / CLK_TCK if prev else 0
+            busy, quiet, since = prev[2:] if prev else (False, 0, now)
+            if rate >= CLAUDE_BUSY_CPU or pid in tools:
+                quiet = 0
+                if not busy:
+                    busy, since = True, now
+            else:
+                quiet += 1
+                if busy and quiet >= 2:      # two quiet samples in a row before calling it idle
+                    busy, since = False, now
+            self._cpu[pid] = (now, ticks, busy, quiet, since)
+            try:
+                cwd = os.readlink(f'/proc/{pid}/cwd')
+            except OSError:
+                continue
+            sid = next((argv[i + 1] for i, a in enumerate(argv[:-1]) if a in ('--resume', '-r')), None)
+            if not sid:                      # plain `claude`: its session is the newest history in that folder
+                hits = glob.glob(os.path.join(PROJ_DIR, re.sub(r'[^A-Za-z0-9]', '-', cwd), '*.jsonl'))
+                sid = os.path.basename(max(hits, key=os.path.getmtime))[:-6] if hits else None
+            out.append({'pid': pid, 'sessionId': sid, 'cwd': cwd, 'startedAt': (BOOT_TIME + start / CLK_TCK) * 1000,
+                        'status': 'busy' if busy else 'idle', 'statusUpdatedAt': since * 1000, 'estimated': True})
+        for pid in self._cpu.keys() - claudes:
+            del self._cpu[pid]
+        return out
 
     def _live(self):
         live, seen = [], set()
@@ -282,6 +370,7 @@ class Monitor:
             'agent': 'claude',
             'key': f'claude:{s.get("pid") or sid}',
             'where': 'a terminal',
+            'estimated': bool(s and s.get('estimated')),
             'sid': sid,
             'name': name,
             'title': title if title != name else None,
@@ -303,7 +392,8 @@ class Monitor:
 
     def scan(self):
         now = time.time()
-        live = sorted(self._live(), key=lambda s: s.get('startedAt') or 0)
+        live = self._live()
+        live = sorted(live + self._fallback({s.get('pid') for s in live}, now), key=lambda s: s.get('startedAt') or 0)
         slow = self.force or now - self.last_slow >= SLOW_S
         if slow:
             self.force, self.last_slow = False, now
@@ -420,7 +510,7 @@ class CodexSource:
         self.mon = mon
         self.threads = []
         self._db_sig = None
-        self._procs = (0.0, False, frozenset())    # (checked at, ChatGPT app running, codex CLI cwds)
+        self._procs = (0.0, False, frozenset(), frozenset())  # (checked at, app running, CLI cwds, open rollouts)
 
     @staticmethod
     def _db_path():
@@ -452,31 +542,44 @@ class CodexSource:
         self.threads, self._db_sig = [dict(r) for r in rows], sig
 
     def _running(self, now):
-        # /proc scan is cached; it only decides whether recent threads still count as open.
+        # Cached /proc scan: ChatGPT app running, interactive `codex` folders, and rollouts held open by codex.
         if now - self._procs[0] < CODEX_PROC_S:
-            return self._procs[1], self._procs[2]
-        app, cwds = False, set()
-        for pid in os.listdir('/proc'):
-            if not pid.isdigit():
-                continue
-            try:
-                with open(f'/proc/{pid}/comm') as f:
-                    comm = f.read().strip()
-            except OSError:
-                continue
+            return self._procs[1:]
+        app, cwds, held = False, set(), set()
+        for pid, (comm, *_rest) in self.mon.procs(now).items():
             if comm == 'ChatGPT':
                 app = True
             elif comm == 'codex':
+                held.update(self._open_rollouts(pid))
                 try:
-                    cwds.add(os.readlink(f'/proc/{pid}/cwd'))
+                    with open(f'/proc/{pid}/cmdline', 'rb') as f:
+                        daemon = b'app-server' in f.read()
+                    if not daemon:           # the background app-server's folder says nothing about open threads
+                        cwds.add(os.readlink(f'/proc/{pid}/cwd'))
                 except OSError:
                     pass
-        self._procs = (now, app, frozenset(cwds))
-        return app, self._procs[2]
+        self._procs = (now, app, frozenset(cwds), frozenset(held))
+        return self._procs[1:]
+
+    @staticmethod
+    def _open_rollouts(pid):
+        # The codex app-server keeps an open thread's rollout file open, which is an exact "open" signal.
+        out = []
+        try:
+            for fd in os.listdir(f'/proc/{pid}/fd'):
+                try:
+                    target = os.readlink(f'/proc/{pid}/fd/{fd}')
+                except OSError:
+                    continue
+                if target.endswith('.jsonl') and '/rollout-' in target:
+                    out.append(target)
+        except OSError:
+            pass
+        return out
 
     def scan(self, now):
         self._load_threads()
-        app, cli_cwds = self._running(now)
+        app, cli_cwds, held = self._running(now)
         live, ended, keep, limits = [], [], set(), None
         for th in self.threads:
             p = th.get('rollout_path')
@@ -492,12 +595,12 @@ class CodexSource:
             in_app = 'desktop' in (th.get('originator') or t.originator or '').lower()
             recent = now - max(mtime, (th.get('updated_ms') or 0) / 1000) < CODEX_ACTIVE_S
             busy = t.turn_open and now - mtime < CODEX_STALE_S
-            is_live = busy or (recent and (app if in_app else cwd in cli_cwds))
+            is_live = busy or p in held or (recent and (app if in_app else cwd in cli_cwds))
             name = (th.get('name') or th.get('title') or os.path.basename(cwd) or th['id'][:8]).strip()
             name = name if len(name) <= 40 else name[:39] + '…'
             (live if is_live else ended).append({
                 'agent': 'codex', 'key': 'codex:' + th['id'], 'sid': th['id'], 'name': name,
-                'title': None, 'cwd': cwd, 'pid': None, 'where': 'ChatGPT app' if in_app else 'Codex CLI',
+                'title': None, 'cwd': cwd, 'pid': None, 'where': 'ChatGPT app' if in_app else 'Codex CLI', 'estimated': False,
                 'status': ('busy' if busy else 'idle') if is_live else 'ended',
                 'started': t.first_ts or (th.get('created_ms') or 0) / 1000 or None,
                 'since': t.turn_ts if busy else (t.done_ts or t.last_ts),
@@ -561,10 +664,16 @@ AMBER, RED = ('#FCD34D', '#D97706'), ('#F87171', '#B91C1C')
 ANIM_MS = {'spawn': 85, 'done': 120, 'close': 110, 'warn': 110, 'full': 110, 'orbit': 200, 'ignite': 80}
 SAT_COLORS = {'claude': '#FF9F6E', 'codex': '#3DDCA8'}   # busy satellite glow per agent
 NOTIFY_MIN_S = 10     # only popup for tasks that ran at least this long
+SOUND = True          # play a soft chime with each popup (GNOME keeps it silent during Do Not Disturb)
+# Chimes as [(start s, Hz)], volume: rising "mission complete", falling "heads-up", low "limit" nudge.
+CHIMES = {'done': ([(0, 659.25), (0.11, 987.77), (0.22, 1318.5)], .32),
+          'warn': ([(0, 783.99), (0.16, 587.33)], .28),
+          'limit': ([(0, 523.25), (0.14, 523.25), (0.28, 392.0)], .28)}
 LABEL_FLASH_S = 4     # how long an event message stays next to the icon
 CTX_WARN, CTX_FULL = 0.80, 0.95   # context-used fractions that trigger a warning / "almost full" popup
 CTX_REARM = 0.70      # warnings reset once usage drops below this (after /compact or /clear)
 LIMIT_WARN = 0.80     # ChatGPT plan window (5-hour / weekly) usage that triggers a popup
+WARN_ACTIVE_S = 3600  # context warnings only for sessions with a message in the last hour
 
 STARS = ((5.5, 6, 1.0), (26.5, 5, .8), (4.8, 24.5, .7), (27.5, 26.5, .9), (15.5, 3.2, .6), (21.5, 29.2, .6))
 ORBIT_RX, ORBIT_RY = 13, 4.2
@@ -753,6 +862,35 @@ def svg_pixbuf(svg, size):
     return ld.get_pixbuf()
 
 
+def chime_wav(notes, vol, path, rate=44100, tail=0.9):
+    """Soft bell: sine plus fading overtones, 6 ms attack and exponential decay, peak-normalised to vol."""
+    n = int(rate * (max(t for t, _ in notes) + tail))
+    buf = [0.0] * n
+    for start, f in notes:
+        s0, w1, w2, w3 = int(start * rate), 2 * math.pi * f / rate, 4 * math.pi * f / rate, 6.02 * math.pi * f / rate
+        for i in range(n - s0):
+            t = i / rate
+            buf[s0 + i] += min(1, t / .006) * math.exp(-t * 5.5) * (
+                math.sin(w1 * i) + .35 * math.sin(w2 * i) * math.exp(-t * 4) + .12 * math.sin(w3 * i) * math.exp(-t * 7))
+    k = vol * 32767 / (max(abs(x) for x in buf) or 1)
+    with wave.open(path, 'wb') as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(struct.pack(f'<{n}h', *(int(x * k) for x in buf)))
+
+
+def sound_path(kind):
+    return os.path.join(CACHE_DIR, f'agent-tray-{kind}-v1.wav')
+
+
+def write_sounds():
+    # Generated once; bump the -v1 suffix after changing CHIMES to regenerate.
+    for kind, (notes, vol) in CHIMES.items():
+        if not os.path.exists(sound_path(kind)):
+            chime_wav(notes, vol, sound_path(kind))
+
+
 class Notifier:
     """Silent desktop popups over org.freedesktop.Notifications; one replaceable popup per session."""
 
@@ -769,11 +907,14 @@ class Notifier:
         except GLib.Error as e:
             print('notifications unavailable:', e.message, file=sys.stderr)
 
-    def notify(self, key, title, body, icon):
+    def notify(self, key, title, body, icon, sound=None):
         if not self.proxy:
             return
-        hints = {'suppress-sound': GLib.Variant('b', True),
-                 'desktop-entry': GLib.Variant('s', 'agent-tray')}
+        hints = {'desktop-entry': GLib.Variant('s', 'agent-tray')}
+        if SOUND and sound and os.path.exists(sound_path(sound)):
+            hints['sound-file'] = GLib.Variant('s', sound_path(sound))
+        else:
+            hints['suppress-sound'] = GLib.Variant('b', True)
         args = GLib.Variant('(susssasa{sv}i)', ('Agent Tray', self.ids.get(key, 0), icon, title, body,
                                                 ['default', 'Open dashboard', 'dash', 'Open dashboard'],
                                                 hints, -1))
@@ -951,7 +1092,13 @@ def esc(s):
 CLAUDE_BIN = shutil.which('claude') or os.path.join(HOME, '.local', 'bin', 'claude')
 CODEX_BIN = shutil.which('codex') or os.path.join(HOME, '.local', 'bin', 'codex')
 CHATGPT_BIN = shutil.which('chatgpt')
-AGENTS = {'claude': ('Claude Code', '🟠'), 'codex': ('ChatGPT', '🟢')}
+AGENTS = {'claude': ('Claude Code', '🟠'), 'codex': ('ChatGPT · Codex', '🟢')}
+
+
+def agent_label(r):
+    if r['agent'] == 'codex':
+        return 'Codex CLI' if r['where'] == 'Codex CLI' else 'ChatGPT'
+    return AGENTS[r['agent']][0]
 TERMINAL = shutil.which('gnome-terminal') or 'x-terminal-emulator'
 
 
@@ -1131,14 +1278,14 @@ class Card(Gtk.Box):
                 ctx.add_class(r['agent'])
             self._agent = r['agent']
             self.logo.set_from_pixbuf(agent_logo(r['agent']))
-            _set(self.agent, AGENTS[r['agent']][0])
             self.gpt_btn.set_visible(r['agent'] == 'codex' and bool(CHATGPT_BIN))
+        _set(self.agent, agent_label(r))
         _set(self.name, esc(r['name']))
         _set(self.title, esc(r['title']))
         self.title.set_visible(bool(r['title']))
         _set(self.folder, esc(r['cwd'].replace(HOME, '~', 1))
              + ((f'  ·  PID {r["pid"]}, open in {r["where"]}' if r['pid'] else f'  ·  open in {r["where"]}')
-                if live else ''))
+                + ('  ·  status estimated' if r.get('estimated') else '') if live else ''))
         _set(self.pill, f'{STATUS[st][1]} {esc(r["status"])}')
 
         cur = r['model']
@@ -1381,9 +1528,12 @@ class App:
         self._menu_sig = None
         self._prev = None                # pid -> row from the previous snapshot
         self._label_msg = self._label_timer = None
-        self._ctx_level = {}             # key -> highest context warning sent (0 none, 1 warn, 2 full)
-        self._limit_sent = set()         # (window, resets_at) plan-limit popups already shown
+        # Warnings already sent survive restarts, so reopening the app never repeats them.
+        self._ctx_level = dict(_load_pref('ctx_warned', {}))     # 'agent:sid' -> 0 none, 1 warn, 2 full
+        self._limit_sent = set(_load_pref('limit_warned', []))  # 'slot:resets_at' popups already shown
         self._write_icons()
+        if SOUND:
+            write_sounds()
         apply_theme()
         self.ind = AI.Indicator.new('agent-tray', 'agent-tray-none-0',
                                     AI.IndicatorCategory.APPLICATION_STATUS)
@@ -1485,44 +1635,56 @@ class App:
 
     def _check_context(self, live, animate):
         # Each level fires once per session; dropping below CTX_REARM (e.g. /compact) re-arms both.
-        levels, msg = {}, None
+        # Sessions nobody has used for WARN_ACTIVE_S stay quiet until they are used again.
+        levels, msg, now = self._ctx_level, None, time.time()
+        before = dict(levels)
         for r in live:
-            pid, used = r['key'], min(r['ctx'] / r['window'], 1.0)
-            old = self._ctx_level.get(pid, 0)
-            hit = 2 if used >= CTX_FULL else 1 if used >= CTX_WARN else 0
-            new = levels[pid] = 0 if used < CTX_REARM else max(old, hit)
-            if new > old:
+            key, used = f'{r["agent"]}:{r["sid"]}', min(r['ctx'] / r['window'], 1.0)
+            old = levels.get(key, 0)
+            if used < CTX_REARM:
+                levels.pop(key, None)
+                continue
+            new = max(old, 2 if used >= CTX_FULL else 1 if used >= CTX_WARN else 0)
+            if new > old and now - (r['last'] or 0) < WARN_ACTIVE_S:
+                levels[key] = new
                 self._notify_ctx(r, new, used)
                 if animate:
                     self.anim.play('full' if new == 2 else 'warn')
                     msg = f'⚠ {r["name"]} ctx {used:.0%}'
-        self._ctx_level = levels
+        if levels != before:
+            while len(levels) > 200:         # keep the saved list small
+                levels.pop(next(iter(levels)))
+            _save_pref('ctx_warned', levels)
         return msg
 
     def _check_limits(self, limits):
         # One popup per plan window per reset period, once usage passes LIMIT_WARN.
+        now = time.time()
         for slot in ('primary', 'secondary'):
             w = (limits or {}).get(slot)
             if not w or (w.get('used_percent') or 0) < LIMIT_WARN * 100:
                 continue
-            key = (slot, w.get('resets_at'))
+            key = f'{slot}:{w.get("resets_at")}'
             if key in self._limit_sent:
                 continue
+            # Forget windows that have already reset, then remember this one.
+            self._limit_sent = {k for k in self._limit_sent if (int(k.split(':')[1]) if k.split(':')[1].isdigit() else 0) > now}
             self._limit_sent.add(key)
+            _save_pref('limit_warned', sorted(self._limit_sent))
             name, at = _window_name(w.get('window_minutes')), w.get('resets_at')
             self.notifier.notify(f'codex:limit:{slot}', f'⚠️ ChatGPT {name} limit {w["used_percent"]:.0f}% used',
                                  f'Plan: {limits.get("plan_type") or "?"}'
                                  + (f' · resets {time.strftime("%a %H:%M", time.localtime(at))}' if at else ''),
-                                 os.path.join(CACHE_DIR, 'agent-tray-warn-4.svg'))
+                                 os.path.join(CACHE_DIR, 'agent-tray-warn-4.svg'), 'limit')
 
     def _notify_ctx(self, r, level, used):
         full = level == 2
         title = f'{"🔴" if full else "⚠️"} {r["name"]} context {"almost full" if full else f"{used:.0%} full"}'
         tip = 'run /compact or start a new session' if full else 'consider /compact soon'
-        body = (f'{AGENTS[r["agent"]][0]} · {fmt_tok(r["ctx"])} of {fmt_tok(r["window"])} used · {tip} · '
+        body = (f'{agent_label(r)} · {fmt_tok(r["ctx"])} of {fmt_tok(r["window"])} used · {tip} · '
                 f'{r["cwd"].replace(HOME, "~", 1)}')
         icon = os.path.join(CACHE_DIR, f'agent-tray-{"full" if full else "warn"}-4.svg')
-        self.notifier.notify(f'{r["sid"]}:ctx', title, body, icon)
+        self.notifier.notify(f'{r["sid"]}:ctx', title, body, icon, 'warn')
 
     def _notify_done(self, old, r):
         # statusUpdatedAt marks when each status began, so the busy span is the gap between them.
@@ -1533,9 +1695,9 @@ class App:
         title = f'{"⏳" if waiting else "✅"} {r["name"]} {"needs attention" if waiting else "finished"}'
         left = 1 - min(r['ctx'] / r['window'], 1.0)
         dur = f'{int(took // 60)}m {int(took % 60):02d}s' if 60 <= took < 600 else fmt_dur(took)
-        body = (f'{AGENTS[r["agent"]][0]} · Took {dur} · {short_model(r["model"])} · {left:.0%} context left · '
+        body = (f'{agent_label(r)} · Took {dur} · {short_model(r["model"])} · {left:.0%} context left · '
                 f'{r["cwd"].replace(HOME, "~", 1)}')
-        self.notifier.notify(r['sid'], title, body, os.path.join(CACHE_DIR, 'agent-tray-done-4.svg'))
+        self.notifier.notify(r['sid'], title, body, os.path.join(CACHE_DIR, 'agent-tray-done-4.svg'), 'done')
 
     def _gauge(self, key):
         g = self._gauges.get(key)
@@ -1565,7 +1727,8 @@ class App:
                     f'{ctx_bar(1 - used)}  {1 - used:.0%} context left',
                     f'⬆ {fmt_tok(i)} in  ·  ⬇ {fmt_tok(o)} out  ·  {fmt_tok(c_r)} cached',
                     f'⏱  running {dur} · active {fmt_dur(r["active"])}',
-                    f'📍  open in {r["where"]}'), (agent, round(used * 20))))
+                    f'📍  open in {r["where"]}' + (' · status estimated' if r.get('estimated') else '')),
+                    (agent, round(used * 20))))
             label = title.upper() + (f'  ·  {len(rows)} running' if rows else '') + (f'  ·  plan {lim} used' if lim else '')
             sections.append((agent, label, items))
         ended = [(f'{AGENTS[r["agent"]][1]}  {r["name"]} — {os.path.basename(r["cwd"]) or "~"}'

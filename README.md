@@ -1,6 +1,6 @@
 # agent-tray
 
-A Linux top-bar indicator for AI coding agents: **Claude Code** and **ChatGPT / Codex**. See every running session, the model it uses, how much context is left, token usage, time spent and your ChatGPT plan limits. Get silent popups when a task finishes or context runs low, and resume any session in one click without typing in a terminal.
+A Linux top-bar indicator for AI coding agents: **Claude Code** and **ChatGPT / Codex**. See every running session, the model it uses, how much context is left, token usage, time spent and your ChatGPT plan limits. Get popups with a soft chime when a task finishes or context runs low, and resume any session in one click without typing in a terminal.
 
 > Unofficial community tool. Not affiliated with or endorsed by Anthropic or OpenAI. All icons (the ✨ AI sparkle, the orange spark and the teal hexagon) are drawn for this project and are not either company's logo.
 
@@ -18,9 +18,9 @@ The icon appears in the top bar. Click it to see your sessions. It starts automa
 
 | Agent | What it reads | Running detection |
 |---|---|---|
-| **Claude Code** (CLI) | `~/.claude/sessions/` and `~/.claude/projects/` | Exact: one file per running process |
+| **Claude Code** (CLI) | `~/.claude/sessions/` and `~/.claude/projects/` | Exact from Claude's status file when it writes one. Claude Code 2.1.285+ may not, so the app also finds running `claude` processes and **estimates** busy / idle from CPU use and running tools (shown as "status estimated") |
 | **ChatGPT desktop app** (coding threads) | `~/.codex/state_*.sqlite` (read-only) and `~/.codex/sessions/` | **Busy** while a turn is running; **open** if the app is running and the thread was used in the last 30 min |
-| **Codex CLI** | Same `~/.codex/` folder | Busy while a turn is running; open while a `codex` process runs in that folder |
+| **Codex CLI** | Same `~/.codex/` folder | Busy while a turn is running; **open exactly** while Codex keeps the thread's file open (the CLI's `codex app-server` background service does this), or while an interactive `codex` runs in that folder |
 
 ChatGPT **web / chat** conversations live on OpenAI's servers and are not shown. Only coding threads saved in `~/.codex` are.
 
@@ -50,7 +50,7 @@ Busy / idle is shown separately, by ⚡ / 💤 in the menu and the status pill o
 
 - **Starts at login** automatically.
 
-### Silent popups
+### Popups with a soft chime
 | When | Popup |
 |---|---|
 | A task that ran 10 s or longer finishes | `✅ poc-28 finished` · `Claude Code · Took 2m 14s · opus-5-5 · 84% context left · ~/POC` |
@@ -59,10 +59,20 @@ Busy / idle is shown separately, by ⚡ / 💤 in the menu and the status pill o
 | Context 95% used | `🔴 poc-28 context almost full` · `run /compact or start a new session` |
 | ChatGPT 5-hour or weekly plan window passes 80% | `⚠️ ChatGPT 5-hour limit 82% used` · `Plan: plus · resets Tue 16:09` |
 
-- No sound, and each popup has an **Open dashboard** button.
+- Each popup plays a short bell chime made for this app, and has an **Open dashboard** button:
+
+  | Popup | Chime |
+  |---|---|
+  | ✅ Task finished | 3 rising notes (E–B–E): "mission complete" |
+  | ⚠️ / 🔴 Context filling up | 2 falling notes (G–D): gentle heads-up |
+  | ⚠️ ChatGPT plan limit | 3 low notes (C–C–G): calm nudge |
+
+- GNOME plays the chime at your normal volume, and keeps both popup and chime silent during **Do Not Disturb**. Set `SOUND = False` for silent popups.
 - A new popup for the same session replaces the previous one.
 - Context warnings fire once per level per session, and reset after `/compact` or `/clear` drops usage below 70%.
-- Plan-limit popups fire once per window per reset period.
+- Sent warnings are remembered in `~/.cache/agent-tray/prefs.json`, so restarting the app never repeats them.
+- Sessions with no message in the last hour don't warn (e.g. a forgotten terminal); they warn once you use them again.
+- Plan-limit popups fire once per window per reset period, also across restarts.
 
 ### Tray menu (click the icon)
 ```
@@ -73,7 +83,7 @@ Busy / idle is shown separately, by ⚡ / 💤 in the menu and the status pill o
  ◔  🟠  gyrodriver       💤 idle · 15h 11m          ▸
  ◕  🟠  agent-tray       ⚡ busy · 28m               ▸
  ───────────────────────────────────────────────────────
- [hexagon]  CHATGPT  ·  1 running  ·  plan 5h 5% · weekly 1% used
+ [hexagon]  CHATGPT · CODEX  ·  1 running  ·  plan 5h 5% · weekly 1% used
  ◔  🟢  Explain GNSS…    ⚡ busy · 28m               ▸
  ───────────────────────────────────────────────────────
  ↺  Resume a past session                           ▸     🟠 supervisor_main …   🟢 …
@@ -102,12 +112,12 @@ Hover over a session to open its submenu:
 ### Dashboard
 A black window with an orange gradient header showing **Running**, **Busy**, **Today tokens** and **Cache reads**. Running sessions are grouped into a **Claude Code** section and a **ChatGPT** section, each with its logo and a count. The ChatGPT section also shows your plan usage (5-hour and weekly, with reset times). New cards slide in.
 
-A switch under the header filters the dashboard to **All**, **🟠 Claude Code** or **🟢 ChatGPT**, with a live count on each button. It applies to both running and recently ended sessions, is instant, and is remembered the next time you open the dashboard (keys **1** / **2** / **3** work too).
+A switch under the header filters the dashboard to **All**, **🟠 Claude Code** or **🟢 ChatGPT · Codex**, with a live count on each button. It applies to both running and recently ended sessions, is instant, and is remembered the next time you open the dashboard (keys **1** / **2** / **3** work too).
 
 Each card has its agent's colour: a coloured left stripe, a faint tint and the agent logo next to the name. Ended cards use a dimmer stripe.
 
 Each card shows:
-- agent logo, name, project folder, status pill (busy / idle / ended) and an agent label (**Claude Code** or **ChatGPT**)
+- agent logo, name, project folder, status pill (busy / idle / ended) and an agent label (**Claude Code**, **ChatGPT** for app threads, or **Codex CLI**)
 - model(s) used, including subagent models, and whether it is a 1M-context model
 - a context bar with **% left**
 - tokens: input, output, cache read, cache write (Claude subagents included)
@@ -156,7 +166,7 @@ ChatGPT cards also have a ↗ button that brings the ChatGPT app to the front.
 - A desktop notification service for popups (built into GNOME, KDE and most desktops).
 - At least one agent:
   - [Claude Code](https://docs.claude.com/en/docs/claude-code), with sessions in `~/.claude/`
-  - the ChatGPT desktop app or the Codex CLI (`npm i -g @openai/codex`), with threads in `~/.codex/`
+  - the ChatGPT desktop app or the Codex CLI (standalone install in `~/.codex/packages/standalone`, or `npm i -g @openai/codex`), with threads in `~/.codex/`
 
 ## Install
 
@@ -184,7 +194,7 @@ bash install.sh
 | See one session's details | Icon menu, then hover over the session |
 | Open the dashboard | Icon menu, then **Open dashboard…**; or middle-click the icon; or click **Open dashboard** on a popup |
 | Close the dashboard | ✕ at the top-right, or press **Esc** (the icon stays in the top bar) |
-| Show only Claude or ChatGPT sessions | The **All / 🟠 Claude Code / 🟢 ChatGPT** switch under the dashboard header, or keys **1** / **2** / **3** |
+| Show only Claude or ChatGPT / Codex sessions | The **All / 🟠 Claude Code / 🟢 ChatGPT · Codex** switch under the dashboard header, or keys **1** / **2** / **3** |
 | Resume an ended session | **Open session** on its card, or icon menu, then **Resume a past session ▸** |
 | Open a running session | **Open copy** on its card, or icon menu, then session, then **Open copy in terminal** (a forked copy) |
 | Bring up the ChatGPT app | ↗ on a ChatGPT card, the **CHATGPT** menu header, or **Open the ChatGPT app** in a thread's submenu |
@@ -219,12 +229,15 @@ Edit these constants in `agent_tray.py` (search for the name), then restart the 
 
 | Setting | Default | What it does |
 |---|---|---|
+| `SOUND` | `True` | Play a soft chime with each popup; `False` for silent popups |
 | `NOTIFY_MIN_S` | `10` | Only show a finished-task popup for tasks that ran at least this many seconds |
 | `LABEL_FLASH_S` | `4` | Seconds the event text stays next to the icon |
 | `CTX_WARN` | `0.80` | Context used (fraction) that triggers the ⚠️ warning popup |
 | `CTX_FULL` | `0.95` | Context used (fraction) that triggers the 🔴 almost-full popup |
 | `CTX_REARM` | `0.70` | Warnings reset once context used drops below this |
+| `WARN_ACTIVE_S` | `3600` | Context warnings only for sessions with a message in the last this-many seconds |
 | `LIMIT_WARN` | `0.80` | ChatGPT plan window usage (fraction) that triggers a popup |
+| `CLAUDE_BUSY_CPU` | `0.015` | For Claude sessions without a status file: CPU share above which the session counts as busy |
 | `CODEX_ACTIVE_S` | `1800` | A ChatGPT / Codex thread counts as open if used this recently while its app runs |
 | `CODEX_STALE_S` | `600` | An unfinished ChatGPT / Codex turn with no activity for this long stops counting as busy |
 | `POLL_S` | `3` | Seconds between checks of live sessions |
@@ -252,7 +265,7 @@ Edit these constants in `agent_tray.py` (search for the name), then restart the 
 - `~/.codex/state_*.sqlite`: the thread list (title, folder, model, last update). The app opens it read-only.
 - `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`: each thread's events. Turn start and finish give busy/idle; token events give usage, context window and plan limits.
 
-A background thread reads both, and passes a snapshot to the GTK main thread only when something changed. The main thread compares each snapshot with the previous one to detect started, finished and closed sessions. It then plays the icon animation, shows the text next to the icon, and sends the popup through `org.freedesktop.Notifications` with sound turned off.
+A background thread reads both, and passes a snapshot to the GTK main thread only when something changed. The main thread compares each snapshot with the previous one to detect started, finished and closed sessions. It then plays the icon animation, shows the text next to the icon, and sends the popup through `org.freedesktop.Notifications` with its chime attached (`sound-file`). The chimes are generated once with Python's `wave` module into `~/.cache/agent-tray/`.
 
 Icon frames are small SVGs generated once into `~/.cache/agent-tray/`.
 
@@ -269,6 +282,8 @@ rm -rf ~/.cache/agent-tray
 - **No icon appears:** on GNOME, check the AppIndicator extension is enabled with `gnome-extensions list --enabled | grep -i appindicator`.
 - **`Namespace AyatanaAppIndicator3 not available`:** run `sudo apt install gir1.2-ayatanaappindicator3-0.1`.
 - **No popups:** check that **Do Not Disturb** is off, and that the task ran longer than `NOTIFY_MIN_S` seconds.
+- **No chime:** check that `SOUND = True`, that system sounds are on (Settings, then Sound, then Alert sound), and that Do Not Disturb is off.
+- **A Claude session says "status estimated":** that Claude Code version didn't write a status file, so busy / idle is estimated from CPU use and running tools. It switches to idle after about 6 quiet seconds.
 - **ChatGPT threads don't show:** check that `~/.codex/` exists and has a `state_*.sqlite` file, and run `agent-tray --dump` to see what the app reads.
 - **"Already running" but no icon, or after an update:** run `bash install.sh`, or `pkill -f "^(/usr/bin/)?python3 .*agent[-_]tray"; agent-tray`.
 - **Open session does nothing:** check that `gnome-terminal` is installed (`which gnome-terminal`), then look in `~/.cache/agent-tray/agent-tray.log` for the error.
