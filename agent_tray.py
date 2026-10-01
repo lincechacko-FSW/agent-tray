@@ -320,12 +320,13 @@ class Monitor:
                 # Stop doesn't fire on Esc; a long-quiet "busy" is shown idle, flagged estimated so no popup fires.
                 if status == 'busy' and quiet * POLL_S >= CLAUDE_STALE_S and now - rec.get('since', now) >= CLAUDE_STALE_S:
                     status, stale = 'idle', True
-                out.append({'pid': pid, 'sessionId': rec['session_id'], 'cwd': rec.get('cwd') or cwd,
+                out.append({'pid': pid, 'procStart': str(start), 'sessionId': rec['session_id'], 'cwd': rec.get('cwd') or cwd,
                             'startedAt': (BOOT_TIME + start / CLK_TCK) * 1000, 'status': status,
                             'statusUpdatedAt': rec.get('since', now) * 1000, 'turn_start': rec.get('turn_start'),
                             'estimated': stale})
                 continue
-            out.append({'pid': pid, 'sessionId': sid, 'cwd': cwd, 'startedAt': (BOOT_TIME + start / CLK_TCK) * 1000,
+            out.append({'pid': pid, 'procStart': str(start), 'sessionId': sid, 'cwd': cwd,
+                        'startedAt': (BOOT_TIME + start / CLK_TCK) * 1000,
                         'status': 'busy' if busy else 'idle', 'statusUpdatedAt': since * 1000, 'estimated': True})
         for pid in self._cpu.keys() - claudes:
             del self._cpu[pid]
@@ -428,6 +429,7 @@ class Monitor:
             'title': title if title != name else None,
             'cwd': s.get('cwd') or (t and t.cwd) or '',
             'pid': s.get('pid'),
+            'proc_start': s.get('procStart') and str(s['procStart']),
             'status': status,
             'started': (s.get('startedAt') or 0) / 1000 or (t and t.first_ts),
             'since': (s.get('statusUpdatedAt') or 0) / 1000 or None,
@@ -562,7 +564,8 @@ class CodexSource:
         self.mon = mon
         self.threads = []
         self._db_sig = None
-        self._procs = (0.0, False, frozenset(), frozenset())  # (checked at, app running, CLI cwds, open rollouts)
+        # (checked at, app running, CLI cwds, rollouts held by codex CLI processes, rollouts held by the app daemon)
+        self._procs = (0.0, False, frozenset(), frozenset(), frozenset())
 
     @staticmethod
     def _db_path():
@@ -597,20 +600,21 @@ class CodexSource:
         # Cached /proc scan: ChatGPT app running, interactive `codex` folders, and rollouts held open by codex.
         if now - self._procs[0] < CODEX_PROC_S:
             return self._procs[1:]
-        app, cwds, held = False, set(), set()
+        app, cwds, held_cli, held_app = False, set(), set(), set()
         for pid, (comm, *_rest) in self.mon.procs(now).items():
             if comm == 'ChatGPT':
                 app = True
             elif comm == 'codex':
-                held.update(self._open_rollouts(pid))
                 try:
                     with open(f'/proc/{pid}/cmdline', 'rb') as f:
                         daemon = b'app-server' in f.read()
-                    if not daemon:           # the background app-server's folder says nothing about open threads
+                    # The shared app-server daemon also holds files of closed CLI threads, so keep it separate.
+                    (held_app if daemon else held_cli).update(self._open_rollouts(pid))
+                    if not daemon:
                         cwds.add(os.readlink(f'/proc/{pid}/cwd'))
                 except OSError:
                     pass
-        self._procs = (now, app, frozenset(cwds), frozenset(held))
+        self._procs = (now, app, frozenset(cwds), frozenset(held_cli), frozenset(held_app))
         return self._procs[1:]
 
     @staticmethod
@@ -631,8 +635,10 @@ class CodexSource:
 
     def scan(self, now):
         self._load_threads()
-        app, cli_cwds, held = self._running(now)
+        app, cli_cwds, held_cli, held_app = self._running(now)
         live, ended, keep, limits = [], [], set(), None
+        # When the app keeps a thread file open, that is exactly the open thread; recency is only a fallback.
+        app_exact = app and any(th.get('rollout_path') in held_app for th in self.threads)
         for th in self.threads:
             p = th.get('rollout_path')
             if not p:
@@ -647,9 +653,15 @@ class CodexSource:
             in_app = 'desktop' in (th.get('originator') or t.originator or '').lower()
             recent = now - max(mtime, (th.get('updated_ms') or 0) / 1000) < CODEX_ACTIVE_S
             busy = t.turn_open and now - mtime < CODEX_STALE_S
-            is_live = busy or p in held or (recent and (app if in_app else cwd in cli_cwds))
+            if in_app:
+                is_live = busy or p in held_app or (recent and app and not app_exact)
+            else:            # a CLI thread is open only while a `codex` terminal process runs it
+                is_live = busy or p in held_cli or (recent and cwd in cli_cwds)
             name = (th.get('name') or th.get('title') or os.path.basename(cwd) or th['id'][:8]).strip()
             name = name if len(name) <= 40 else name[:39] + '…'
+            title = (th.get('title') or '').strip()
+            hint = (title if title and title.lower() != name.lower() else None,
+                    t.first_ts or (th.get('created_ms') or 0) / 1000 or None)
             (live if is_live else ended).append({
                 'agent': 'codex', 'key': 'codex:' + th['id'], 'sid': th['id'], 'name': name,
                 'title': None, 'cwd': cwd, 'pid': None, 'where': 'ChatGPT app' if in_app else 'Codex CLI', 'estimated': False, 'turn_start': t.turn_ts,
@@ -658,9 +670,32 @@ class CodexSource:
                 'since': t.turn_ts if busy else (t.done_ts or t.last_ts),
                 'last': t.last_ts or mtime, 'active': t.active,
                 'model': t.model or th.get('model'), 'models': list(t.models), 'tok': list(t.tok),
-                'ctx': t.ctx, 'window': t.window, 'cost': None, 'api_ms': None})
+                'ctx': t.ctx, 'window': t.window, 'cost': None, 'api_ms': None, '_hint': hint})
             if t.limits and (limits is None or t.limits_ts > limits[0]):
                 limits = (t.limits_ts, t.limits)
+        # The app keeps sibling threads with the same name loaded; list one per name+folder as running
+        # (busy first, then most recent) and move the rest to the past sessions.
+        best = {}
+        for r in live:
+            k, cur = (r['name'], r['cwd']), best.get((r['name'], r['cwd']))
+            if cur is None or (r['status'] == 'busy', r['last'] or 0) > (cur['status'] == 'busy', cur['last'] or 0):
+                best[k] = r
+        winners = {id(r) for r in best.values()}
+        for r in live:
+            if id(r) not in winners:
+                r['status'] = 'ended'
+                ended.append(r)
+        live = [r for r in live if id(r) in winners]
+        # Same-named past threads get their first message and start time so they can be told apart.
+        for rows in (live, ended):
+            counts = {}
+            for r in rows:
+                counts[r['name']] = counts.get(r['name'], 0) + 1
+            for r in rows:
+                first, started = r.pop('_hint')
+                if counts[r['name']] > 1:
+                    r['name'] += ''.join((f' · "{first[:20]}"' if first else '',
+                                          time.strftime(' · %H:%M', time.localtime(started)) if started else ''))
         return live, ended, keep, limits and limits[1]
 
 
@@ -844,6 +879,7 @@ CHIMES = {'done': ([(0, 659.25), (0.11, 987.77), (0.22, 1318.5)], .32),
 LABEL_FLASH_S = 4     # how long an event message stays next to the icon
 CTX_WARN, CTX_FULL = 0.80, 0.95   # context-used fractions that trigger a warning / "almost full" popup
 CTX_REARM = 0.70      # warnings reset once usage drops below this (after /compact or /clear)
+END_GRACE_S = 5       # seconds to wait after a polite stop before offering Force stop
 LIMIT_WARN = 0.80     # ChatGPT plan window (5-hour / weekly) usage that triggers a popup
 WARN_ACTIVE_S = 3600  # context warnings only for sessions with a message in the last hour
 
@@ -1235,6 +1271,7 @@ button.primary label { color: #FFFFFF; }
 button.icon { background-image: none; background-color: transparent; border: none; box-shadow: none;
     border-radius: 999px; padding: 4px 6px; color: #A3A3A3; }
 button.icon:hover { background-color: #1F1F1F; color: #FFFFFF; }
+button.icon.danger:hover { background-color: #3A1414; color: #F87171; }
 .empty { background-color: #0A0A0A; border: 1px dashed #2A2A2A; border-radius: 14px; padding: 18px; color: #A3A3A3; }
 """
 
@@ -1327,6 +1364,48 @@ def ctx_bar(left, n=10):
     return '▰' * k + '▱' * (n - k)
 
 
+def end_target(r):
+    """(pid, start, label) of the process to stop for a session row, or an explanation string if there is none."""
+    if r['agent'] == 'claude':
+        pid, start = r.get('pid'), r.get('proc_start')
+        if not pid or not start:
+            return 'This session has no process the tray can identify.'
+        if _proc_start(pid) != start or 'claude' not in ' '.join(_argv(pid)).lower():
+            return 'This session has already ended.'
+        return pid, start, f'the claude process (PID {pid})'
+    if r['where'] == 'ChatGPT app':
+        return 'Threads inside the ChatGPT app share one process; stop it in the ChatGPT app.'
+    pids = []
+    for name in os.listdir('/proc'):
+        if not name.isdigit():
+            continue
+        try:
+            with open(f'/proc/{name}/comm') as f:
+                if f.read().strip() != 'codex':
+                    continue
+            if 'app-server' in _argv(name) or os.readlink(f'/proc/{name}/cwd') != r['cwd']:
+                continue
+        except OSError:
+            continue
+        pids.append(int(name))
+    if len(pids) != 1:
+        return ('No codex process is running in this folder.' if not pids else
+                f'{len(pids)} codex processes run in this folder, so the tray can\'t tell which one to stop.')
+    return pids[0], _proc_start(pids[0]), f'the codex process (PID {pids[0]})'
+
+
+def stop_process(pid, start, sig):
+    # Re-check the start time right before signalling: a recycled PID must never be hit.
+    if _proc_start(pid) != start:
+        return False
+    try:
+        os.kill(pid, sig)
+        return True
+    except (ProcessLookupError, PermissionError) as e:
+        print('could not stop', pid, e, file=sys.stderr)
+        return False
+
+
 def launch_session(r, fork=False):
     # New terminal in the session's folder running the agent's resume/fork; the shell stays afterwards.
     cwd = r['cwd'] if os.path.isdir(r['cwd']) else HOME
@@ -1386,7 +1465,7 @@ def _icon_btn(icon, tip, cb):
 
 
 class Card(Gtk.Box):
-    def __init__(self):
+    def __init__(self, on_end=None):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         _cls(self, 'card')
         self.row = self._state = None
@@ -1430,6 +1509,11 @@ class Card(Gtk.Box):
         actions = _box(self.open_btn, self.gpt_btn,
                        _icon_btn('folder-open-symbolic', 'Open project folder', self._open),
                        _icon_btn('edit-copy-symbolic', 'Copy resume command', self._copy), spacing=4)
+        # Packed at the far end, away from the other buttons, so it isn't hit by accident.
+        self.end_btn = _cls(_icon_btn('process-stop-symbolic', 'End session…',
+                                      lambda _b: self.row and on_end and on_end(self.row)), 'danger')
+        self.end_btn.set_no_show_all(True)
+        actions.pack_end(self.end_btn, False, False, 0)
         for w in (top, models, ctx, self.ctx_note, stats, self.time, actions):
             self.pack_start(w, False, False, 0)
         self.show_all()
@@ -1494,6 +1578,8 @@ class Card(Gtk.Box):
             parts.append(f'<b>${r["cost"]:.2f}</b>')
         _set(self.time, f'<small>{"  ·  ".join(parts)}</small>')
 
+        self.end_btn.set_visible(live)
+        self.end_btn.set_tooltip_text('Stop it in the ChatGPT app' if r['where'] == 'ChatGPT app' else 'End session…')
         label = 'Open copy' if live else 'Open session'
         if self.open_btn.get_label() != label:
             self.open_btn.set_label(label)
@@ -1553,8 +1639,9 @@ def _section(title):
 
 
 class Dashboard(Gtk.Window):
-    def __init__(self, on_refresh):
+    def __init__(self, on_refresh, on_end=None):
         super().__init__(title='Agent Tray')
+        self.on_end = on_end
         _cls(self, 'dash')
         self.set_default_size(540, 760)
         self.connect('delete-event', lambda w, _e: w.hide() or True)   # closing only hides
@@ -1684,7 +1771,7 @@ class Dashboard(Gtk.Window):
         for i, r in enumerate(rows):
             c = cards.get(r['sid'])
             if c is None:
-                c = cards[r['sid']] = Card()
+                c = cards[r['sid']] = Card(self.on_end)
                 rev = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN,
                                    transition_duration=280, reveal_child=not slide)
                 rev.add(c)
@@ -1718,7 +1805,7 @@ class App:
         self.anim = Animator(self.ind)
         self.notifier = Notifier(lambda: self.show_dashboard())
         self.monitor = Monitor(lambda snap: GLib.idle_add(self.render, snap))
-        self.win = Dashboard(lambda: self.monitor.poke(force=True))
+        self.win = Dashboard(lambda: self.monitor.poke(force=True), self._end_from_card)
         self._gauges = {}                # (status, used/20) -> menu icon pixbuf
         self._logo = svg_pixbuf(ICON_FRAMES['idle'][0], 16)
         self._build_menu({'live': [], 'ended': [], 'today': [0, 0], 'limits': None}, time.time())
@@ -1959,6 +2046,11 @@ class App:
                     add('💬  Open the ChatGPT app', open_chatgpt, into=sub)
                 add('📁  Open folder', lambda _i, r=r: open_folder(r), into=sub)
                 add('📋  Copy resume command', lambda _i, r=r: copy_resume(r), into=sub)
+                sub.append(Gtk.SeparatorMenuItem())
+                if r['where'] == 'ChatGPT app':
+                    add('⏹  Stop it in the ChatGPT app…', open_chatgpt, into=sub)
+                else:     # deferred so the dialog opens after the menu has closed
+                    add('⏹  End session…', lambda _i, r=r: GLib.idle_add(self._end_session, r), into=sub)
                 add(title, icon=self._gauge(gauge)).set_submenu(sub)
         if not any(items for _, _, items in sections):
             menu.append(Gtk.SeparatorMenuItem())
@@ -1976,6 +2068,54 @@ class App:
         menu.show_all()
         self.ind.set_menu(menu)
         self.ind.set_secondary_activate_target(dash)    # middle-click opens dashboard
+
+    def _ask(self, title, body, action=None, destructive=False):
+        dlg = Gtk.MessageDialog(message_type=Gtk.MessageType.WARNING if action else Gtk.MessageType.INFO,
+                                text=title, secondary_text=body, modal=True)
+        dlg.set_keep_above(True)
+        if action:
+            dlg.add_button('Cancel', Gtk.ResponseType.CANCEL)
+            btn = dlg.add_button(action, Gtk.ResponseType.OK)
+            if destructive:
+                btn.get_style_context().add_class('destructive-action')
+            dlg.set_default_response(Gtk.ResponseType.CANCEL)
+        else:
+            dlg.add_button('OK', Gtk.ResponseType.OK)
+        ok = dlg.run() == Gtk.ResponseType.OK
+        dlg.destroy()
+        return ok
+
+    def _end_from_card(self, r):
+        if r['where'] == 'ChatGPT app':      # its threads share one process
+            open_chatgpt()
+        else:
+            self._end_session(r)
+
+    def _end_session(self, r):
+        target = end_target(r)
+        if isinstance(target, str):
+            self._ask(f'Can\'t end "{r["name"]}"', target)
+            return
+        pid, start, what = target
+        body = (f'This stops {what} in {r["cwd"].replace(HOME, "~", 1)}.\n'
+                + ('⚡ It\'s working right now, so the current reply will be cut off.\n' if r['status'] == 'busy' else '')
+                + 'The conversation is saved; you can resume it later.')
+        if not self._ask(f'End "{r["name"]}"?', body, 'End session', destructive=True):
+            return
+        if not stop_process(pid, start, signal.SIGTERM):
+            self._ask(f'"{r["name"]}" already ended', 'The process was no longer running.')
+        else:
+            GLib.timeout_add_seconds(END_GRACE_S, self._end_check, r, pid, start)
+        self.monitor.poke()
+
+    def _end_check(self, r, pid, start):
+        if _proc_start(pid) == start and self._ask(
+                f'"{r["name"]}" is still running',
+                f'It didn\'t stop within {END_GRACE_S} seconds. Force stop it? Anything not yet saved is lost.',
+                'Force stop', destructive=True):
+            stop_process(pid, start, signal.SIGKILL)
+        self.monitor.poke()
+        return False
 
     def show_dashboard(self, *_):
         if self.snap:

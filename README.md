@@ -19,8 +19,8 @@ The icon appears in the top bar. Click it to see your sessions. It starts automa
 | Agent | What it reads | Running detection |
 |---|---|---|
 | **Claude Code** (CLI) | Claude Code **hooks** (installed by `install.sh`), `~/.claude/sessions/` and `~/.claude/projects/` | **Exact** from hooks: busy when you send a message, ⏳ waiting at a permission prompt, idle when Claude finishes. Without hooks it uses Claude's status file, or as a last resort **estimates** busy / idle from CPU (shown as "status estimated"; estimates never trigger popups) |
-| **ChatGPT desktop app** (coding threads) | `~/.codex/state_*.sqlite` (read-only) and `~/.codex/sessions/` | **Busy** while a turn is running; **open** if the app is running and the thread was used in the last 30 min |
-| **Codex CLI** | Same `~/.codex/` folder | Busy while a turn is running; **open exactly** while Codex keeps the thread's file open (the CLI's `codex app-server` background service does this), or while an interactive `codex` runs in that folder |
+| **ChatGPT desktop app** (coding threads) | `~/.codex/state_*.sqlite` (read-only) and `~/.codex/sessions/` | **Busy** while a turn is running; **open exactly** while the app's background service keeps the thread's file open (falls back to "used in the last 30 min while the app runs" if that can't be read) |
+| **Codex CLI** | Same `~/.codex/` folder | Busy while a turn is running; **open** only while an interactive `codex` process runs the thread (holds its file open, or runs in that folder). The shared `codex app-server` service doesn't count: it also keeps files of closed CLI threads open |
 
 ChatGPT **web / chat** conversations live on OpenAI's servers and are not shown. Only coding threads saved in `~/.codex` are.
 
@@ -32,7 +32,7 @@ ChatGPT **web / chat** conversations live on OpenAI's servers and are not shown.
 | **Claude Code** | 🟠 orange | orange spark | menu section header, 🟠 before each session, orange gauge ring, card stripe, tint and logo |
 | **ChatGPT / Codex** | 🟢 teal | teal hexagon | menu section header, 🟢 before each session, teal gauge ring, card stripe, tint, logo and button |
 
-Busy / idle is shown separately, by ⚡ / 💤 in the menu and the status pill on each card.
+Status is shown separately, by ⚡ busy / 💤 idle / ⏳ waiting in the menu and the status pill on each card.
 
 ### Top-bar icon
 - **Always there:** a lavender ✨ AI sparkle in a faint orbit ring on a starry navy badge, with the number of running sessions next to it. It turns grey when nothing is running.
@@ -104,10 +104,13 @@ Hover over a session to open its submenu:
  💬  Open the ChatGPT app      (ChatGPT threads only)
  📁  Open folder
  📋  Copy resume command
+ ────────────
+ ⏹  End session…               (ChatGPT app threads: "Stop it in the ChatGPT app…")
 ```
 - Sessions are grouped by agent under a header with the agent's logo. The ChatGPT header shows your plan usage.
 - Each session has a **ring gauge icon** in its agent's colour, with the agent's mark inside. The ring fills with context used.
 - **Resume a past session ▸** lists the last 10 ended sessions from both agents (🟠 Claude, 🟢 ChatGPT).
+- The ChatGPT app often gives several threads the same name. Open threads with the same name in the same folder are listed **once** (the busy one, otherwise the most recently used), and same-named past threads get their first message and start time, e.g. `Study this project · "exit" · 12:22`.
 
 ### Dashboard
 A black window with an orange gradient header showing **Running**, **Busy**, **Today tokens** and **Cache reads**. Running sessions are grouped into a **Claude Code** section and a **ChatGPT** section, each with its logo and a count. The ChatGPT section also shows your plan usage (5-hour and weekly, with reset times). New cards slide in.
@@ -117,7 +120,7 @@ A switch under the header filters the dashboard to **All**, **🟠 Claude Code**
 Each card has its agent's colour: a coloured left stripe, a faint tint and the agent logo next to the name. Ended cards use a dimmer stripe.
 
 Each card shows:
-- agent logo, name, project folder, status pill (busy / idle / ended) and an agent label (**Claude Code**, **ChatGPT** for app threads, or **Codex CLI**)
+- agent logo, name, project folder, status pill (busy / idle / ⏳ waiting / ended) and an agent label (**Claude Code**, **ChatGPT** for app threads, or **Codex CLI**)
 - model(s) used, including subagent models, and whether it is a 1M-context model
 - a context bar with **% left**
 - tokens: input, output, cache read, cache write (Claude subagents included)
@@ -131,7 +134,7 @@ Each card shows:
 | Ended ChatGPT / Codex thread | **Open session** | `codex resume <id>` |
 | Open ChatGPT / Codex thread | **Open copy** | `codex fork <id>` (the original is untouched) |
 
-ChatGPT cards also have a ↗ button that brings the ChatGPT app to the front.
+ChatGPT cards also have a ↗ button that brings the ChatGPT app to the front. Running cards have a ⏹ **End session** button at the far right (see [Ending a session](#ending-a-session)).
 
 ### Light on resources
 - Reads only the lines added to session files since the last check
@@ -203,10 +206,18 @@ bash install.sh
 | Bring up the ChatGPT app | ↗ on a ChatGPT card, the **CHATGPT** menu header, or **Open the ChatGPT app** in a thread's submenu |
 | Open the project folder | 📁 on a card, or icon menu, then session, then **Open folder** |
 | Copy the resume command | 📋 on a card, or icon menu, then session, then **Copy resume command** |
+| End a running session | ⏹ at the far right of a running card, or icon menu, then session, then **⏹ End session…** (asks first; the conversation stays resumable) |
 | Refresh now | ↻ in the dashboard title bar, or icon menu, then **Refresh** |
 | Stop | Icon menu, then **Quit** |
 
 Closing the terminal you started it from doesn't stop the app, and starting it twice won't add a second icon. Resume terminals always open as new windows, whichever way the app was started.
+
+### Ending a session
+**⏹ End session…** in a session's submenu, or the ⏹ button on a running dashboard card, stops that agent process after you confirm:
+- It sends a normal stop (SIGTERM) so the agent exits cleanly. If it is still running after 5 s (`END_GRACE_S`), it asks before a **Force stop** (SIGKILL).
+- Right before stopping, it re-checks that the PID still belongs to the same `claude` / `codex` process, so a recycled PID is never hit.
+- Works for Claude Code sessions and Codex CLI sessions (when one `codex` process runs in that folder). Threads inside the **ChatGPT app** share one process, so for those the item opens the app instead.
+- The conversation is saved, and the session moves to **Resume a past session**.
 
 ### Command-line options
 
@@ -242,6 +253,7 @@ Edit these constants in `agent_tray.py` (search for the name), then restart the 
 | `CTX_REARM` | `0.70` | Warnings reset once context used drops below this |
 | `WARN_ACTIVE_S` | `3600` | Context warnings only for sessions with a message in the last this-many seconds |
 | `LIMIT_WARN` | `0.80` | ChatGPT plan window usage (fraction) that triggers a popup |
+| `END_GRACE_S` | `5` | Seconds to wait after **End session** before offering **Force stop** |
 | `CLAUDE_STALE_S` | `180` | A hook-"busy" Claude session quiet this long is shown idle (the turn was interrupted with Esc) |
 | `CLAUDE_BUSY_CPU` | `0.015` | For Claude sessions without a status file: CPU share above which the session counts as busy |
 | `CODEX_ACTIVE_S` | `1800` | A ChatGPT / Codex thread counts as open if used this recently while its app runs |
@@ -303,6 +315,7 @@ rm -rf ~/.cache/agent-tray
 - **ChatGPT threads don't show:** check that `~/.codex/` exists and has a `state_*.sqlite` file, and run `agent-tray --dump` to see what the app reads.
 - **"Already running" but no icon, or after an update:** run `bash install.sh`, or `pkill -f "^(/usr/bin/)?python3 .*agent[-_]tray"; agent-tray`.
 - **Open session does nothing:** check that `gnome-terminal` is installed (`which gnome-terminal`), then look in `~/.cache/agent-tray/agent-tray.log` for the error.
+- **End session says "No codex process is running in this folder":** that Codex CLI thread isn't running in any terminal any more. Refresh the menu; it should be under **Resume a past session**.
 - **Resume says the conversation was not found:** the project folder was moved or deleted, and Claude Code finds sessions by folder.
 - **Anything else:** run `agent-tray --foreground` to see errors in the terminal. Quit the running copy first.
 
